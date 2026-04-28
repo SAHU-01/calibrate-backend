@@ -40,8 +40,8 @@ The backend wraps the `calibrate` CLI tool and orchestrates evaluation jobs whil
 calibrate-backend/
 ├── src/
 │   ├── main.py              # FastAPI app entry point, lifespan management
-│   ├── db.py                # SQLite database layer (~3200 lines)
-│   ├── utils.py             # Shared utilities (S3 client, tool config building)
+│   ├── db.py                # SQLite database layer (~5000 lines)
+│   ├── utils.py             # Shared utilities (S3 client/upload helpers, STT/TTS evaluator run pairing, tool config building)
 │   ├── dataset_utils.py     # Dataset resolution helpers for STT/TTS evaluations
 │   ├── job_recovery.py      # Restart in-progress jobs on app startup
 │   └── routers/
@@ -54,13 +54,14 @@ calibrate-backend/
 │       ├── agent_tests.py   # Agent test execution & benchmarking
 │       ├── personas.py      # Persona CRUD operations
 │       ├── scenarios.py     # Scenario CRUD operations
-│       ├── metrics.py       # Metric/evaluation criteria CRUD
+│       ├── evaluators.py    # Evaluator CRUD, invoke, default prompts
 │       ├── simulations.py   # Simulation orchestration (chat/voice)
 │       ├── datasets.py      # Dataset CRUD and item management
 │       ├── stt.py           # STT provider evaluation
 │       ├── tts.py           # TTS provider evaluation
-│       ├── datasets.py      # Dataset CRUD and item management
 │       ├── jobs.py          # Job listing API (STT/TTS eval jobs)
+│       ├── public.py        # Share-token read-only endpoints (STT/TTS/tests/benchmarks/simulations)
+│       ├── api_keys.py      # API key CRUD (evaluator invoke / automation)
 │       └── user_limits.py   # Per-user limits CRUD and limit queries
 ├── db/
 │   └── calibrate.db         # SQLite database file
@@ -83,6 +84,8 @@ users
   ├── personas (user_id FK)
   ├── scenarios (user_id FK)
   ├── metrics (user_id FK)
+  ├── evaluators (owner_user_id FK, nullable for seeded defaults)
+  ├── api_keys (user_id FK)
   ├── simulations (user_id FK)
   ├── datasets (user_id FK)
   ├── jobs (user_id FK)
@@ -100,7 +103,7 @@ agents
 simulations
   ├── simulation_personas (many-to-many with personas)
   ├── simulation_scenarios (many-to-many with scenarios)
-  ├── simulation_metrics (many-to-many with metrics)
+  ├── simulation_evaluators (many-to-many: simulations ↔ evaluator versions)
   └── simulation_jobs
 ```
 
@@ -114,14 +117,18 @@ simulations
 | `tests`           | Test cases with evaluation criteria                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `personas`        | Simulated user personas (characteristics, gender, language)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `scenarios`       | Conversation scenarios/contexts                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `metrics`         | Evaluation criteria for simulations                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `simulations`     | Simulation configurations linking agents, personas, scenarios, metrics                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `metrics`         | Legacy evaluation criteria rows (frozen for old data); **new work uses `evaluators` + `evaluator_versions`** and pivots (`simulation_evaluators`, `test_evaluators`, STT/TTS job `details.evaluators`). Migration assigns **new** evaluator UUIDs (`evaluators.source_metric_uuid` stores the old `metrics.uuid`); APIs resolve legacy ids only to produce **400** hints, not to accept them as links.                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `evaluators` / `evaluator_versions` | User-defined and seeded judges (prompt, rubric, judge model); versions pin rubric per run                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `simulations`     | Simulation configurations linking agents, personas, scenarios, and evaluators (via `simulation_evaluators`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `datasets`        | Named collections of evaluation inputs (STT or TTS), user_id FK                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `dataset_items`   | Individual items within a dataset (text, optional audio_path, `updated_at` — nullable for pre-migration rows)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `jobs`            | Generic STT/TTS evaluation jobs (user_id FK to users)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `agent_test_jobs` | LLM unit test and benchmark jobs                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `simulation_jobs` | Chat/voice simulation jobs                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `user_limits`     | Per-user limits/quotas as a JSON blob (one row per user, `user_id` UNIQUE). No soft delete — hard delete only. The `limits` JSON is validated at the API layer via the `UserLimits` Pydantic model in `user_limits.py` (with `Field(gt=0, le=10000)` constraints); currently only `max_rows_per_eval` is permitted. The `create_user_limits` endpoint validates user existence explicitly via `get_user()` (returns 404) because SQLite FK constraints are not enforced (`PRAGMA foreign_keys` is off), and handles race conditions via `sqlite3.IntegrityError` catch (returns 409). `update_user_limits()` in `db.py` returns the updated row directly (update + select in one connection) to avoid extra round-trips. DB functions accept `UserLimits` type (imported via `TYPE_CHECKING` to avoid circular imports) |
+| `api_keys`        | Per-user API keys for **`POST /evaluators/{uuid}/invoke`** (and similar automation). Stores bcrypt hash + short `key_prefix` for lookup; raw key never persisted. Soft-deleted rows excluded from lookup |
+
+**Seeded default evaluators** (`db.py`): `init_db()` runs **`_seed_default_evaluators()`**, which walks **`DEFAULT_EVALUATORS_SEED`** (stable `slug`s such as `default-llm-next-reply`, `default-stt-transcription`, `default-faithfulness`, simulation defaults, etc.). It is **idempotent** on every startup: missing rows are created; existing rows get **`evaluators` metadata** (`name`, **`description`**, `evaluator_type`, …) **UPDATE**d when the seed text differs; if the **live** `evaluator_versions` row’s prompt/rubric/`variables` no longer matches the seed, a **new version** is inserted and promoted to **live** so pinned links stay reproducible. **`DEFAULT_PROMPTS_BY_PURPOSE`** stays aligned with **`GET /evaluators/default-prompt`** for LLM/STT/TTS/simulation prefills. **Copy convention**: the seed’s **evaluator-level `description`** (the short blurb in evaluator lists) intentionally **omits a trailing full stop**; nested rubric lines under **`output_config.scale`** may still end with a period where the judge wording calls for it.
 
 ### Users Table Schema
 
@@ -186,8 +193,9 @@ The JWT token contains the user's UUID and is validated on every protected endpo
 - `/tests` - Test cases (CRUD + bulk upload + bulk delete)
 - `/personas` - User personas
 - `/scenarios` - Conversation scenarios
-- `/metrics` - Evaluation metrics
-- `/simulations` - Simulation configurations
+- `/evaluators` - Evaluator CRUD, default prompts (`GET /evaluators/default-prompt`). **`POST /evaluators/{uuid}/invoke`** uses **`get_user_from_api_key`** (API key — `X-API-Key` or `Authorization: Bearer <calib_…>`), not JWT; all other evaluator routes use JWT. Replaces the removed `/metrics` router for new work.
+- `/api-keys` - Create (returns raw key once), list metadata, soft-delete keys (JWT only). Keys authenticate the evaluator invoke endpoint.
+- `/simulations` - Simulation configurations (CRUD + run/status)
 - `/datasets` - Dataset CRUD, item management (add/update/delete items), `eval_count` per dataset (number of linked STT/TTS eval jobs via `json_extract` on jobs `details`)
 - `/users` - User management (read-only)
 - `/user-limits` - Per-user limits CRUD + `/me/max-rows-per-eval` query endpoint. Mutating endpoints (`POST`, `PUT`, `DELETE`) require superadmin (`require_superadmin` dependency composes `get_current_user_id` for token validation, then checks JWT email against `SUPERADMIN_EMAIL` env var); read endpoints (`GET`) require only standard JWT auth
@@ -226,7 +234,11 @@ All dataset endpoints require JWT auth. Every DB operation is scoped to the auth
 
 #### Simulations
 
-- `POST /simulations/{uuid}/run` - Start simulation (chat or voice)
+- `GET /simulations` - List simulations for the current user
+- `POST /simulations` - Create simulation (`name`, optional `agent_uuid`, `persona_uuids`, `scenario_uuids`, `evaluators`). **`SimulationCreate` / `SimulationUpdate` / `EvaluatorRef` use `extra='forbid'`** — unknown JSON keys (e.g. `metric_uuids`, `metrics` as a substitute for evaluator links) produce **422** instead of being silently dropped. Each evaluator link must reference **`evaluators.uuid`**. Legacy **`metrics.uuid`** values are **rejected** with **400**; the response includes the migrated evaluator UUID when `evaluators.source_metric_uuid` matches (`get_evaluator_uuid_for_legacy_metric()` in `db.py`). Only evaluators with **`evaluator_type: simulation`** are allowed. Validation is centralized in `_resolve_simulation_evaluator_ref()` in `routers/simulations.py`. `legacy_metric_uuid_exists()` covers edge cases where a legacy `metrics` row has no migrated evaluator.
+- `GET /simulations/{uuid}` - Simulation detail with linked agent, personas, scenarios, and **evaluators** (from `simulation_evaluators`). An **empty `evaluators` array** means no pivot rows — typically the client omitted `evaluators` on create, sent nonstandard property names (before strict `forbid`), or never ran a successful PUT with evaluator links.
+- `PUT /simulations/{uuid}` - Update simulation; when `evaluators` is provided it **replaces** all evaluator links. Same validation as `POST`.
+- `POST /simulations/{uuid}/run` - Start simulation (chat or voice). Creates `simulation_jobs` with **`details.evaluators`**: an ordered list `[{ "uuid": <evaluator_uuid> }, …]` matching **`get_evaluators_for_simulation`** / the calibrate config (written by **`_snapshot_evaluators_for_job_details()`**). Used later to pair run output with evaluator rows and stable links; unrelated to STT/TTS job `details.evaluators` shape.
 - `GET /simulations/run/{task_id}` - Get simulation run status (includes timeout detection, partial results for voice)
 - `POST /simulations/run/{job_uuid}/abort` - Abort a running simulation (kills process, saves partial results with abort marker, triggers next queued job); returns full `SimulationRunStatusResponse`
 - `DELETE /simulations/run/{job_uuid}` - Delete a simulation job (kills process, triggers next queued job)
@@ -238,6 +250,8 @@ All dataset endpoints require JWT auth. Every DB operation is scoped to the auth
 - `completed_simulations` - Number of completed simulations (for in_progress text/voice simulations)
 - `simulation_results` - Array of simulation results (partial for in_progress; includes both complete and in-progress simulations). Each result includes an `aborted` field (`true`/`false`/`null`) set by the abort endpoint for incomplete/complete simulations respectively; `null` for non-aborted runs.
 - `metrics` - Aggregated evaluation metrics (only populated when all simulations complete)
+- `evaluators` - Optional list of `SimulationEvaluatorRef`: `{ evaluator_uuid, name }` (**`name`** is resolved with **`get_evaluator()`** at fetch time so renames appear without changing stored results). Requires a job-level snapshot (`simulation_jobs.details.evaluators`). **`apply_simulation_job_evaluator_enrichment()`** (`routers/simulations.py`) attaches **`evaluator_uuid`** to each **`evaluation_results`** row by **index** against that snapshot (same ordering as calibrate’s `evaluators` array / CSV rows). Jobs created before snapshots existed omit both the top-level list and row ids.
+  - **Gotcha**: Index pairing trusts that **`evaluation_results.csv`** row order matches the snapshot order. Use **`evaluator_uuid`** for stable navigation; CSV **`name`** strings are not rewritten when an evaluator is renamed.
 
 #### API Documentation (HTTP Basic Auth Protected)
 
@@ -452,6 +466,13 @@ The `is_job_timed_out(updated_at)` utility function in `utils.py` handles timest
 | `kill_processes_from_dict()`    | `utils.py` | Kills multiple processes from a dict                                                         |
 | `capture_exception_to_sentry()` | `utils.py` | Logs exception to Sentry as unhandled error                                                  |
 | `build_tool_configs()`          | `utils.py` | Builds calibrate tool configs from agent tools (handles structured_output and webhook types) |
+| `build_evaluator_runs_for_eval_job()` | `utils.py` | Pairs `job.details.evaluators` (order) with nested evaluator keys in STT/TTS `metrics` (values with `"type"`) for `ProviderResult.evaluator_runs` |
+| `enrich_evaluator_runs_with_current_names()` | `utils.py` | Fills `name` on each run from `get_evaluator()`; backfills `evaluator_runs` from `metrics` for old jobs missing the field; used by STT/TTS/auth + `public.py` responses |
+| `apply_simulation_job_evaluator_enrichment()` | `routers/simulations.py` | **`simulation_jobs` only**: reads minimal UUID snapshot from `details.evaluators`; returns top-level `evaluators` with current names; mutates each `evaluation_results` dict to add `evaluator_uuid` by row index. Used by **`GET /simulations/run/{task_id}`**, **`POST …/abort`**, and **`GET /public/simulation-run/{token}`** (imported from `public.py`). |
+| `_enrich_test_results_with_evaluators()` | `routers/agent_tests.py` | **`agent_test_jobs` only**: reads per-test snapshot from `details.evaluators_by_test_name`; converts each row's raw calibrate `judge_results` dict into `List[JudgeResult]` with `evaluator_uuid`, **current** DB name (refreshed via `get_evaluator()`), the snapshot-frozen `variable_values`, and (for rating evaluators) `scale_min`/`scale_max` from the pinned version's rubric. Idempotent — re-runs only refresh `name`. Falls back to the snapshot calibrate name when the evaluator can't be resolved. Used by **`GET /agent-tests/run/{task_id}`**, **`/agent-tests/agent/{uuid}/runs`**, **`/agent-tests/runs`**, and the public **`GET /public/test-run/{token}`** (imported from `public.py`). |
+| `_enrich_model_results_with_evaluators()` | `routers/agent_tests.py` | Benchmark wrapper that runs `_enrich_test_results_with_evaluators` against every `model_results[i].test_results` list (the same per-test snapshot applies to every model, since all models in a benchmark run the same test suite). Used by **`GET /agent-tests/benchmark/{task_id}`** and the public **`GET /public/benchmark/{token}`**. |
+| `upload_top_level_files_to_s3()` | `utils.py` | Run-root files only (STT/TTS success path) |
+| `upload_directory_tree_to_s3()` | `utils.py` | Full directory tree (STT/TTS failure paths; LLM unit test/benchmark completion and failures) |
 
 ### Dataset Resolution for STT/TTS Evaluations
 
@@ -478,12 +499,12 @@ STT and TTS evaluations run a single `calibrate stt` or `calibrate tts` command 
 - **Single command execution**: All providers evaluated in one CLI call (e.g., `calibrate stt -p openai deepgram sarvam -l english -i input -o output`)
 - **Internal parallelization**: The calibrate CLI handles concurrent provider execution internally
 - **Automatic leaderboard**: The CLI generates the leaderboard in `output/leaderboard/` as part of the same command
-- **Job completion**: After the command completes, the backend reads per-provider results and the leaderboard, then uploads to S3
-- **Leaderboard reading**: The backend finds any `.xlsx` file in the leaderboard directory (dynamic discovery) and reads the `summary` sheet
+- **Job completion**: After the command completes, the backend reads per-provider results and the leaderboard, then uploads to S3 (see **S3 artifacts for STT/TTS** below).
+- **Leaderboard reading**: The backend finds any `.xlsx` file in the leaderboard directory (dynamic discovery) and reads the `summary` sheet. Calibrate may also emit leaderboard CSV/XLSX at the run root; those are uploaded as top-level files under the job prefix.
 
 **Intermediate updates via on-demand disk reads**: The background task stores the `output_dir` path in job details. When the status API is called for an `in_progress` job, it reads each provider's `results.csv` (and `metrics.json` if available) directly from disk. This provides per-file progress as the CLI writes rows to `results.csv` incrementally. Unlike simulations which poll and update the DB with results, STT/TTS reads are on-demand from the status API. **Important**: Because intermediate results are only read from disk (never persisted to DB during `in_progress`), error and timeout handlers must explicitly read from disk via `_collect_intermediate_results()` before saving the failure to DB — otherwise all intermediate provider results would be lost.
 
-**Heartbeat to prevent false timeouts**: The background task uses a polling loop with a 60-second heartbeat interval. While waiting for the CLI process to complete, it calls `update_job(task_id)` every 60 seconds to refresh the `updated_at` timestamp. This prevents the job from being falsely marked as timed out when the CLI takes longer than the 5-minute timeout threshold. Without this heartbeat, a job running for 6+ minutes would be killed by the status API's timeout detection even though it's still actively processing.
+**Heartbeat to prevent false timeouts**: The background task uses a polling loop (~2 seconds per iteration). While waiting for the CLI process to complete, it calls `update_job(task_id)` on each iteration to refresh the `updated_at` timestamp. This prevents the job from being falsely marked as timed out when the CLI takes longer than the 5-minute timeout threshold.
 
 **Response Model (`TaskCreateResponse`):**
 
@@ -507,15 +528,32 @@ STT and TTS evaluations run a single `calibrate stt` or `calibrate tts` command 
 | `leaderboard_summary` | `Optional[List[Dict]]`           | Summary after job completes                                                                         |
 | `error`               | `Optional[str]`                  | Error message if job failed                                                                         |
 
+**Evaluators (STT/TTS)**: Jobs optionally take `evaluator_uuids`; at creation time each UUID is resolved to a pinned evaluator **version** and stored in `job.details.evaluators` (hydrated dicts). The background task passes `--config` with `{"evaluators": [...]}` built by `build_evaluator_cli_payload()` when that list is non-empty. Default seeded evaluators apply when no UUIDs are sent (`default-stt-transcription` / `default-tts-audio-quality`).
+
 **Response Model (`ProviderResult`):**
 
-| Field      | Type                           | When Present                                                                                                                                                                                                                  |
-| ---------- | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `provider` | `str`                          | Always                                                                                                                                                                                                                        |
-| `success`  | `Optional[bool]`               | `None` while provider is still running/queued (during `in_progress`), `True` when provider finishes all files with metrics ready (even if overall job is still `in_progress`), `True`/`False` when job completes or fails     |
-| `message`  | `Optional[str]`                | `"Queued..."` → `"Running... (N files/texts processed)"` → `"Done (N files/texts processed)"` (when provider finishes during in_progress) → `"Completed"` or error message (when job finishes). Present for both STT and TTS. |
-| `metrics`  | `Optional[Dict \| List[Dict]]` | Available when provider's `metrics.json` exists (during or after execution)                                                                                                                                                   |
-| `results`  | `Optional[List[Dict]]`         | Partial rows from `results.csv` while running, complete when done                                                                                                                                                             |
+| Field              | Type                              | When Present                                                                                                                                                                                                                                                                 |
+| ------------------ | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `provider`         | `str`                             | Always                                                                                                                                                                                                                                                                       |
+| `success`          | `Optional[bool]`                  | `None` while provider is still running/queued (during `in_progress`), `True` when provider finishes all files with metrics ready (even if overall job is still `in_progress`), `True`/`False` when job completes or fails                                                      |
+| `message`          | N/A in schema                     | In-progress status responses often use plain dicts with a human-readable `message` for progress text; the strict `ProviderResult` model may omit this field — clients should not rely on `message` being in the OpenAPI schema for completed jobs.                              |
+| `metrics`          | `Optional[Dict \| List[Dict]]`    | Raw `metrics.json` for the provider when present (after `normalize_metrics()` for legacy list-shaped metrics).                                                                                                                                                                 |
+| `evaluator_runs`   | `Optional[List[EvaluatorRunEntry]]` | One entry per evaluator whose aggregate appears as a **nested** object in `metrics` (paired by submission order vs. ordered keys in the metrics dict whose values are objects containing `"type"`). Each entry has `evaluator_uuid`, `metric_key` (CLI key for that run), `aggregate` (nested dict from calibrate), and `name` (current DB name at response time; use for display, `metric_key` for artifact correlation). |
+| `results`          | `Optional[List[Dict]]`            | Partial rows from `results.csv` while running, complete when done                                                                                                                                                                                                            |
+
+**Public STT/TTS shares** (`GET /public/stt/{token}`, `GET /public/tts/{token}`): Same `provider_results` enrichment as authenticated status (including `evaluator_runs` names).
+
+**Public simulation shares** (`GET /public/simulation-run/{token}`): Same **`evaluators`** list and per-row **`evaluator_uuid`** enrichment as authenticated **`GET /simulations/run/{task_id}`** (`apply_simulation_job_evaluator_enrichment()`), after voice presigned URL regeneration.
+
+**Evaluator-snapshot pattern across job types** — three job families capture an evaluator snapshot in `details` at submission time, then enrich results with **current** DB names at every read. Each family uses a different snapshot shape because each calibrate output keys evaluator results differently:
+
+| Job family                 | Snapshot in `details`                                     | Mapping back to UUID                                                                            | Enrichment helper                                  |
+| -------------------------- | --------------------------------------------------------- | ----------------------------------------------------------------------------------------------- | -------------------------------------------------- |
+| STT / TTS                  | `details.evaluators` — full hydrated evaluator dicts      | Submission order ↔ ordered nested keys in `metrics.json` (values with `"type"`)                  | `enrich_evaluator_runs_with_current_names()`       |
+| Simulation                 | `details.evaluators` — minimal `[{ "uuid" }]` list        | Submission order ↔ row index in `evaluation_results.csv`                                         | `apply_simulation_job_evaluator_enrichment()`      |
+| LLM unit test / benchmark  | `details.evaluators_by_test_name` — per-test name → `[{uuid, calibrate_name, output_type, variable_values, scale_min?, scale_max?}]` | Calibrate evaluator name (the `judge_results` dict key) ↔ UUID via the per-test mapping. Different tests can reference different evaluator subsets, so the snapshot is per-test, not run-level. The snapshot also freezes the `variable_values` sent to calibrate and (for rating evaluators) the rubric `scale_min`/`scale_max`, so each `JudgeResult` carries the inputs and bounds the run actually used. | `_enrich_test_results_with_evaluators()` (+ `_enrich_model_results_with_evaluators` for benchmarks) |
+
+All three are read-time mutations on the response payload — UUIDs are stored, names are refreshed on each read so renames flow through immediately without a re-run.
 
 **TTS success determination**: A TTS provider is marked `success: true` only if at least one text was successfully synthesized (has an `audio_path` in results). If the calibrate CLI completes but no audio files were generated (e.g., voice not found, API errors), `success: false` is returned with an error message. This prevents false positives where the process exits normally but all synthesis attempts failed.
 
@@ -527,7 +565,7 @@ STT and TTS evaluations run a single `calibrate stt` or `calibrate tts` command 
 - **TTS audio paths during in-progress**: Local audio files are uploaded to S3 on-the-fly (using the same key convention as the final upload: `tts/evals/{task_id}/outputs/{provider}/...`) and presigned download URLs are returned. Falls back to `null` if the file doesn't exist or upload fails. The uploads are idempotent — the final background task upload overwrites the same keys.
 - **Fallback**: If `output_dir` is not in job details (e.g., process hasn't started yet), all providers shown with `success: null` and `metrics`/`results` as `null`
 
-**Preserving results on failure (STT & TTS)**: When an STT or TTS job fails (subprocess error, timeout, or unexpected exception), the error handlers use `_collect_intermediate_results()` (STT) or `_collect_tts_intermediate_results()` (TTS) to read whatever partial results exist on disk before saving to DB. This ensures that providers that completed successfully retain their `metrics` and `results` even when other providers caused the failure. Each helper reads each provider's `results.csv` and `metrics.json`, marking providers with data as `success: true` and those without as `success: false`. The TTS helper additionally uploads audio files to S3 and replaces local paths with S3 keys (matching the success path pattern), so that presigned URLs can be generated when the status is fetched.
+**Preserving results on failure (STT & TTS)**: When an STT or TTS job fails (subprocess error, timeout, or unexpected exception), the error handlers use `_collect_intermediate_results()` (STT) or `_collect_tts_intermediate_results()` (TTS) to read whatever partial results exist on disk before saving to DB. This ensures that providers that completed successfully retain their `metrics` and `results` even when other providers caused the failure. Each helper reads each provider's `results.csv` and `metrics.json`, marks providers with data as `success: true` (or false as appropriate), and attaches `evaluator_runs` when evaluators + metrics allow pairing. The TTS helper additionally uploads audio files to S3 and replaces local paths with S3 keys (matching the success path pattern), so that presigned URLs can be generated when the status is fetched. **S3**: After collecting intermediates, the handlers call `upload_directory_tree_to_s3()` on the entire calibrate `output_dir` under `stt/evals/{task_id}/outputs` or `tts/evals/{task_id}/outputs` so logs and partial artifacts (including top-level `logs`) are retained for debugging.
 
 **Critical: Merging results on timeout** (STT & TTS): When the status API detects a timeout, it must **merge** intermediate results from disk with any existing successful results already stored in the database — NOT replace them. This is critical because:
 
@@ -539,27 +577,31 @@ The timeout handler builds a map of existing successful providers (`success: tru
 
 **Presigned URLs for failed jobs (TTS)**: Presigned URL generation for audio files runs for both `done` and `failed` jobs. This ensures that providers which completed successfully within a failed job still serve accessible audio URLs, not raw S3 keys.
 
-**Metrics normalization**: The status API normalizes old list-of-dicts metrics format to the new dict format before returning. The `_normalize_metrics()` helper handles two old formats:
+**Metrics normalization**: The status API normalizes old list-of-dicts metrics format to the new dict format before returning. The `normalize_metrics()` helper in `utils.py` handles two old formats:
 
 - Simple metrics: `[{"wer": 2.4}, {"string_similarity": 0.15}, ...]` → merged into result dict
 - Latency metrics: `[{"metric_name": "ttfb", "mean": 0.1, ...}, ...]` → uses `metric_name` as key, rest as value
 
 This ensures clients always receive metrics in dict format (e.g., `{"wer": 2.4, "ttfb": {"mean": 0.1, ...}}`) regardless of when the job was created.
 
+**Calibrate STT/TTS nested evaluator metrics (current CLI)**: For each configured evaluator, calibrate emits a **single nested object** under a stable key (derived from evaluator naming), e.g. `semantic_match: {"type": "binary", "mean": 0.85}`. Legacy flat keys `<name>_score` / `<name>_info` are obsolete. Identify evaluator-shaped entries as dict values that include `"type"` (scalar metrics like `wer` remain numbers; `ttfb` may be a dict without `"type"` depending on CLI version — see `utils.is_evaluator_metric_aggregate()` used for API pairing). Per-row CSV columns drop the `_score` suffix (column name equals the evaluator key; reasoning stays `<name>_reasoning`).
+
 **STT Metrics** (returned by `calibrate stt`):
 
 - `wer` - Word Error Rate (float)
-- `string_similarity` - String similarity score (float)
-- `llm_judge_score` - LLM judge accuracy score (float)
+- `string_similarity` - String similarity score (float), when enabled
+- Plus **evaluator-named keys** (nested objects with `type` / `mean` / scale fields) from linked evaluators — **not** limited to legacy `llm_judge_score` scalar; prefer `evaluator_runs` on the API for stable UUID + display name
 - `processing_time` - Processing time stats: `{mean, std, values}` (may be absent/null)
 - `ttfb` - Time to First Byte stats: `{mean, std, values}` (may be absent/null)
 
 **TTS Metrics** (returned by `calibrate tts`):
 
-- `llm_judge_score` - LLM judge accuracy score (float)
+- Evaluator nested objects as above; legacy `llm_judge_score` may appear on older runs
 - `ttfb` - Time to First Byte stats: `{mean, std, values}` (may be absent/null)
 
-Note: TTS does not return `processing_time`. Both `ttfb` values may be absent if the provider doesn't support streaming or the measurement failed - clients should handle null/missing values.
+Note: TTS does not return `processing_time`. Both `ttfb` values may be absent if the provider doesn't support streaming or the measurement failed — clients should handle null/missing values.
+
+**Pairing gotcha**: `evaluator_runs` zips `job.details.evaluators` order with ordered evaluator-style keys from `metrics`. If calibrate emits a different number of nested evaluator keys than configured evaluators, the backend logs a warning and pairs up to `min(counts)` — do not assume name string match between `metric_key` and current evaluator name; use `evaluator_uuid` + `name` from the API.
 
 **TTS `results` row `audio_path` field:**
 
@@ -567,6 +609,19 @@ Note: TTS does not return `processing_time`. Both `ttfb` values may be absent if
 - **On status fetch**: Presigned URL generated on-the-fly for completed jobs
 
 This allows secure, time-limited access to audio files without storing expirable URLs in the database.
+
+### S3 artifacts for STT/TTS eval jobs
+
+Calibrate writes a **run-level** `logs` file (and optionally CSV/XLSX leaderboard files) **directly under** the CLI `output_dir`, while per-provider folders contain that provider's `metrics.json`, `results.csv`, `logs`, etc. Because per-provider uploads only walked each provider subdirectory, **top-level files were historically missing from S3** unless handled explicitly.
+
+**Current behavior** (`utils.py`):
+
+| Helper | Purpose |
+| ------ | ------- |
+| `upload_top_level_files_to_s3()` | Uploads **only regular files whose parent is** `output_dir` (e.g. `logs`, root `leaderboard.csv`, backend's `stdout.log` / `stderr.log`). Keys: `stt/evals/{task_id}/outputs/<filename>` or `tts/evals/{task_id}/outputs/<filename>`. |
+| `upload_directory_tree_to_s3()` | Recursive upload of an entire directory tree (used on STT/TTS **failure** paths after intermediate collection, so partial runs still retain **all** log files and outputs under the same prefixes). |
+
+**Success path**: Per-provider subtree upload (unchanged relative layout under `…/outputs/{provider}/`), then **`upload_top_level_files_to_s3`** for root files, then leaderboard directory walk (`…/leaderboard/`). **Failure path**: After preserving DB intermediates, **`upload_directory_tree_to_s3`** on full `output_dir` (may overlap keys with earlier partial uploads — overwrites are acceptable).
 
 ### Simulation Incremental Updates (Text and Voice)
 
@@ -582,7 +637,7 @@ Both text simulations (`calibrate llm simulations run`) and voice simulations (`
   - **For completed simulations**:
     - `persona` and `scenario` data (always populated via config.json or fallback)
     - `transcript` from `transcript.json`
-    - `evaluation_results` with per-criterion metrics (name, value, reasoning) from `evaluation_results.csv`
+    - `evaluation_results` with per-criterion metrics from `evaluation_results.csv` (name, value, reasoning). When returned through the **run status** or **public simulation share** APIs, each row may also include **`evaluator_uuid`** (added at read time via **`apply_simulation_job_evaluator_enrichment()`**, not stored in the CSV)
   - **For in-progress simulations** (both text and voice):
     - `persona` and `scenario` data (always populated via config.json or fallback)
     - `transcript` from `transcript.json` (partial conversation so far)
@@ -604,40 +659,111 @@ This allows clients to display progress and per-simulation results (including pa
 
 ### Agent Test Job Results Format
 
-Agent test jobs (`llm-unit-test`) run a single `calibrate llm` command with the model specified. The backend monitors the output directory during execution and provides incremental results as each test completes.
+Agent test jobs (`llm-unit-test`) run a single `calibrate llm` command. The backend monitors the output directory during execution and provides incremental results as each test completes. The CLI shape — and the on-disk layout — depends on whether the agent has a `config.agent_url`:
 
-- **Single command execution**: `calibrate llm -c config.json -m model -p provider -o output`
+- **Mode A — internal LLM** (`agent_config.agent_url` is **not** set):
+  `calibrate llm -c config.json -m {model} -p {provider} -o output`
+  Files land under a per-model subfolder: `<output_dir>/<provider>__<model>/{results.json, metrics.json, results.log, logs}`. Calibrate may also write a `<output_dir>/leaderboard/` (single-model unit tests typically still get one — the file is written but only contains one row).
+- **Mode C — agent connection** (`agent_config.agent_url` is set):
+  `calibrate llm -c config.json -o output --skip-verify` (**no `-m`, no `-p`** — the agent owns the model decision; the backend stores a placeholder `model = "agent-connection"` for internal logging only).
+  Files land **directly at the top level** of `<output_dir>`: `{results.json, metrics.json, results.log, logs}`. **No `leaderboard/` is generated** in this mode (only one set of results, so no comparison row).
+
+Both modes are read by the same code path — `_read_agent_test_results_json()` / `_read_agent_test_metrics_json()` use `os.walk` to find the first `results.json` / `metrics.json` anywhere under `output_dir`, so Mode A's subfolder and Mode C's top-level files are both handled without branching.
+
 - **Polling interval**: Every 2 seconds while the subprocess is running
 - **During execution**: The backend reads `results.json` and updates the database incrementally
 - **Test completion detection**: When a test appears in `results.json`, it's shown with full results; pending tests show just the name
+- **S3 upload on completion**: The full calibrate output directory is uploaded recursively via `upload_directory_tree_to_s3()` to `agent-tests/runs/{task_id}/`, preserving whichever layout calibrate produced (Mode A subfolder vs. Mode C flat).
+- **S3 on subprocess failure**: The same recursive upload runs in failure handlers when `output_dir` still exists; **`results.results_s3_prefix`** is set to `agent-tests/runs/{task_id}` when upload succeeds so clients can locate artifacts after a failed run.
 
 **Response Model (`TestCaseResult`):**
 
-| Field       | Type                   | When Present                                    |
-| ----------- | ---------------------- | ----------------------------------------------- |
-| `name`      | `Optional[str]`        | Always (pending and completed tests)            |
-| `passed`    | `Optional[bool]`       | When test completes (appears in `results.json`) |
-| `output`    | `Optional[TestOutput]` | When test completes                             |
-| `test_case` | `Optional[Dict]`       | When test completes                             |
+| Field            | Type                          | When Present                                                                                                                                                                                          |
+| ---------------- | ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`           | `Optional[str]`               | Always (pending and completed tests)                                                                                                                                                                  |
+| `passed`         | `Optional[bool]`              | When test completes (appears in `results.json`)                                                                                                                                                       |
+| `reasoning`      | `Optional[str]`               | When test completes — `"All evaluators passed"` / `"Tool calls matched expected"` for passing rows; the first failing evaluator's reasoning (or a no-response message) for failing rows. Null for passing tool-call tests. |
+| `output`         | `Optional[TestOutput]`        | When test completes                                                                                                                                                                                   |
+| `test_case`      | `Optional[Dict]`              | When test completes (verbatim copy of the original config entry)                                                                                                                                      |
+| `judge_results`  | `Optional[List[JudgeResult]]` | **Response-type tests only** — one entry per evaluator referenced by that test case (see below). `None` for tool-call tests and pending rows.                                                          |
+
+**`JudgeResult`** — one evaluator's verdict for a response-type test case. Refreshed on every API read so renames flow through immediately:
+
+| Field             | Type                       | Notes                                                                                                                       |
+| ----------------- | -------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `evaluator_uuid`  | `Optional[str]`            | The pinned evaluator UUID from the job snapshot. **`None`** for legacy runs without a snapshot, or when the snapshot lookup misses. |
+| `name`            | `str`                      | **Current** evaluator name from `get_evaluator()`; falls back to the calibrate-rendered snapshot name on miss.              |
+| `reasoning`       | `Optional[str]`            | Per-evaluator reasoning string emitted by the judge.                                                                        |
+| `match`           | `Optional[bool]`           | Set for **binary** evaluators (`true`/`false`).                                                                             |
+| `score`           | `Optional[float]`          | Set for **rating** evaluators (number on the evaluator's scale).                                                            |
+| `variable_values` | `Optional[Dict[str, Any]]` | The `{{var}}` substitutions used for **this** evaluator on **this** test case (e.g. `{"criteria": "Be very friendly"}`). Comes from `test_evaluators.variable_values` frozen at submission time, so it always reflects what the run actually used even if the link is later edited. `None` (not `{}`) when no variables apply. |
+| `scale_min`       | `Optional[float]`          | **Rating only** — minimum value of the rubric the run actually used (from the pinned evaluator-version `output_config.scale`). `None` for binary evaluators. |
+| `scale_max`       | `Optional[float]`          | **Rating only** — maximum value of the rubric the run actually used. Pairs with `scale_min` so clients can render `score / scale_max` etc. without separately fetching the evaluator. |
 
 This allows clients to see which tests have completed with their results while other tests are still running.
 
+**Per-test evaluator snapshot (`details.evaluators_by_test_name`)**: At job creation time, both `run_agent_test` and `run_agent_benchmark` call `_build_calibrate_config(agent, tests)` (which now returns `(config, evaluators_by_test_name)`) and persist the snapshot under `agent_test_jobs.details.evaluators_by_test_name`. Shape:
+
+```jsonc
+{
+  "<test_name>": [                                    // omitted for tool_call tests / tests with no evaluators
+    {
+      "uuid": "<evaluator_uuid>",
+      "name": "<calibrate-rendered_name>",            // calibrate's judge_results key for this test
+      "output_type": "binary" | "rating",
+      "variable_values": { "criteria": "..." },       // {{var}} substitutions sent to calibrate; {} if none
+      "scale_min": 1.0,                               // rating only — omitted for binary
+      "scale_max": 5.0                                // rating only — omitted for binary
+    },
+    ...
+  ],
+  ...
+}
+```
+
+The inner `name` is **not** the DB display name — it is the unique calibrate-rendered evaluator name produced by `build_test_evaluators_payload()` (with the `-{uuid8}` collision suffix when two evaluators share a base name in the same run). It is the exact key calibrate emits inside `metrics.judge_results` for that test case, so it round-trips back to the evaluator UUID at read time.
+
+`variable_values` and `scale_min`/`scale_max` are **frozen at submission time** (the same source-of-truth instant where `evaluator_version_id` is pinned via the `test_evaluators` link): `variable_values` comes straight from the `test_evaluators` row's JSON column, and the rating bounds come from that pinned version's `output_config.scale` (numeric values only — `bool` is rejected so a binary scale of `[false, true]` doesn't accidentally surface as `[0, 1]`). This way, a rename, a prompt edit, or a rubric change after submission never alters how a past run is displayed.
+
+**Read-time enrichment (`_enrich_test_results_with_evaluators`)**: Every API endpoint that returns `test_results` (`GET /agent-tests/run/{task_id}`, `GET /agent-tests/agent/{uuid}/runs`, `GET /agent-tests/runs`, and the public `GET /public/test-run/{token}`) calls this helper before serializing. It:
+
+1. Reads `details.evaluators_by_test_name` and builds a per-test `calibrate_name → snapshot_entry` map.
+2. Walks each row's stored `judge_results` (currently a raw dict from calibrate, keyed by calibrate name) and converts it to a `List[JudgeResult]` with `evaluator_uuid`, `match`/`score`, `reasoning`, and the snapshot-frozen `variable_values` + `scale_min` / `scale_max`. Empty `variable_values` (`{}`) is normalised to `None` to keep the response slim.
+3. Looks up each entry's evaluator via `get_evaluator(uuid)` to refresh `name` to the **current** DB value (latest rename wins). Falls back to the snapshot's calibrate-rendered name when the evaluator was deleted, the snapshot is missing (legacy run), or the run pre-dates the snapshot capture.
+
+The helper is **idempotent**: if `judge_results` is already a list (already enriched in this request, or written that way by some future writer), only `name` is refreshed — the snapshot-derived fields (`variable_values`, `scale_min`, `scale_max`) are populated only on the first conversion from the raw calibrate dict.
+
+**Why the snapshot lives on the job (not the test case)**: A test's `test_evaluators` pivots can change after the job is submitted; the snapshot freezes the exact evaluator UUIDs **and the variable values + rating bounds the run actually used** so result rows always map back correctly. Names are *not* frozen — they're refreshed on every read so a rename surfaces immediately without a re-run.
+
+**Tool-call tests**: Calibrate emits no `judge_results` for tool-call tests (`metrics.passed` + `metrics.reasoning` are the only verdicts). `_parse_agent_test_results` stores `judge_results: None` and the enrichment helper short-circuits, so `JudgeResult` entries are never produced for tool-call rows.
+
 ### Benchmark Job Results Format
 
-Benchmark jobs (`llm-benchmark`) run a single `calibrate llm` command with all models specified at once. The calibrate CLI handles parallelization internally and generates the leaderboard automatically.
+Benchmark jobs (`llm-benchmark`) run a single `calibrate llm` command with all models specified at once. The calibrate CLI handles parallelization internally and generates the leaderboard automatically. As with unit tests, the CLI shape and the on-disk model-folder convention depend on whether the agent has a `config.agent_url`:
 
-- **Single command execution**: All models evaluated in one CLI call (e.g., `calibrate llm -c config.json -m gpt-4.1 claude-3.5-sonnet -p openrouter -o output`)
-- **Model name normalization (agent connections only)**: The frontend always sends model names in OpenRouter format (`provider/model`, e.g. `openai/gpt-4.1`). For agent connections, if `benchmark_provider` is not `openrouter`, the `provider/` prefix is stripped before passing to the CLI (e.g. `openai/gpt-4.1` → `gpt-4.1`). The original names are preserved for display in API responses (`model` field in `ModelResult`) and in `benchmark_models_verified` keys. This stripping does not apply to non-connection agents (`type: "agent"`).
-- **Internal parallelization**: The calibrate CLI handles concurrent model execution internally
-- **Automatic leaderboard**: The CLI generates the leaderboard in `output/leaderboard/` as part of the same command
-- **Output discovery**: After command completes, uses `os.walk()` on the output directory to find all `results.json` and `metrics.json` files
-- **Model name matching**: `_match_model_to_folder()` maps CLI model names to the output folders calibrate creates. It uses **exact matching** (not substring matching) across known calibrate naming conventions:
-  - `openai/gpt-4` → `openai_gpt-4` (single underscore)
-  - `openai/gpt-4` → `openai__gpt-4` (double underscore)
-  - `openai/gpt-4` → `openai-gpt-4` (dash)
-  - `openai/gpt-4` → `openai/gpt-4` (literal)
+- **Mode A — internal LLM** (`agent_config.agent_url` is **not** set):
+  `calibrate llm -c config.json -m m1 m2 -p {provider} -o output`
+  Per-model folder: calibrate uses `<provider>__<model>` for `provider == "openai"` and the bare `<model>` (with `/` → `__`) otherwise. With OpenRouter it's effectively `<vendor>__<model>` because the model itself contains a slash (e.g., `openai/gpt-4.1` → `openai__gpt-4.1`).
+- **Mode B — agent connection benchmark** (`agent_config.agent_url` is set, `request.models` non-empty):
+  `calibrate llm -c config.json -m m1 m2 -o output --skip-verify` (**no `-p`** — the CLI sends each `-m` value as a `model` field in the request body so the agent routes internally).
+  Per-model folder is **always** `<cli_model>` with `/` → `__` — **no provider prefix is prepended**. The `cli_model` may differ from the display model name when the prefix has been stripped (see below).
 
-  **Gotcha**: Exact matching is required because substring matching caused silent cross-model contamination when one model name was a prefix of another (e.g. benchmarking `gpt-5.4` alongside `gpt-5.4-mini`, or `openai/gpt-4.1` alongside `openai/gpt-4.1-mini`). With substring matching, iterating folders in filesystem order could match `gpt-5.4`'s name as a substring of the `gpt-5.4-mini` folder, causing the backend to store the wrong model's `results.json`/`metrics.json` under `gpt-5.4`. The leaderboard CSV path was not affected (it's read directly from `leaderboard/llm_leaderboard.csv`). If the calibrate CLI ever introduces a new folder-name convention, it must be added to the candidate set in `_match_model_to_folder` explicitly.
+There is no "Mode C" path for benchmarks because the create endpoint requires `request.models` to be non-empty (single-model agent-connection runs go through the unit-test path instead, which is Mode C).
+
+- **Single command execution**: All models evaluated in one CLI call.
+- **Model name normalization (agent connections only)**: The frontend always sends model names in OpenRouter format (`provider/model`, e.g. `openai/gpt-4.1`). For agent connections, if `benchmark_provider` is not `openrouter`, the `provider/` prefix is stripped before passing to the CLI (e.g. `openai/gpt-4.1` → `gpt-4.1`), so the CLI folder becomes the bare model name (e.g. `gpt-4.1`) instead of `openai__gpt-4.1`. The original names are preserved for display in API responses (`model` field in `ModelResult`) and in `benchmark_models_verified` keys. This stripping does not apply to non-connection agents (`type: "agent"`).
+- **Internal parallelization**: The calibrate CLI handles concurrent model execution internally.
+- **Automatic leaderboard**: The CLI generates `output/leaderboard/llm_leaderboard.csv` in both Mode A and Mode B (any time `-m` is supplied, regardless of how many models).
+- **Output discovery**: After command completes, `_find_all_results_in_output()` walks `output_dir` and keys per-folder `(results.json, metrics.json)` pairs by **folder basename**.
+- **Model name matching**: `_match_model_to_folder()` maps a CLI model name to its output folder. It uses **exact matching** (not substring matching) across the candidate set, which deliberately covers both Mode A and Mode B folder shapes:
+  - `openai/gpt-4` → `openai_gpt-4` (single underscore — historical compat)
+  - `openai/gpt-4` → `openai__gpt-4` (double underscore — Mode A openrouter / Mode A openai / Mode B with `provider/model` cli value)
+  - `openai/gpt-4` → `openai-gpt-4` (dash — historical compat)
+  - `openai/gpt-4` → `openai/gpt-4` (literal — never produced by calibrate today, kept defensively)
+  - `gpt-4` → `gpt-4` (bare — Mode B after `provider/` prefix stripping)
+
+  **Gotcha**: Exact matching is required because substring matching caused silent cross-model contamination when one model name was a prefix of another (e.g. benchmarking `gpt-5.4` alongside `gpt-5.4-mini`, or `openai/gpt-4.1` alongside `openai/gpt-4.1-mini`). With substring matching, iterating folders in filesystem order could match `gpt-5.4`'s name as a substring of the `gpt-5.4-mini` folder, causing the backend to store the wrong model's `results.json`/`metrics.json` under `gpt-5.4`. The leaderboard CSV path was not affected (it's read directly from `leaderboard/llm_leaderboard.csv`). If calibrate ever introduces a **new** folder-name convention (e.g., a colon separator, or some new agent-mode shape), it must be added to the candidate set in `_match_model_to_folder` explicitly — substring fallbacks must not be reintroduced.
+
 - **Polling interval**: Every 2 seconds while the subprocess is running
 - **During execution**: The backend scans output directory for per-model results and updates incrementally
 - **Job completion**: Final results and `leaderboard_summary` populated after command completes
@@ -652,7 +778,7 @@ Benchmark jobs (`llm-benchmark`) run a single `calibrate llm` command with all m
 | `total_tests`  | `Optional[int]`        | When model has results (partial or complete)                |
 | `passed`       | `Optional[int]`        | When model has results                                      |
 | `failed`       | `Optional[int]`        | When model has results                                      |
-| `test_results` | `Optional[List[Dict]]` | When model has results (partial or complete)                |
+| `test_results` | `Optional[List[Dict]]` | When model has results (partial or complete). Each row has the same shape as `TestCaseResult` (including `judge_results` enriched via `_enrich_model_results_with_evaluators` — the helper applies the same per-test evaluator snapshot to every model's nested `test_results`, since all models in a benchmark run the same test suite). |
 
 **Model states during execution:**
 
@@ -664,24 +790,24 @@ This allows clients to see per-model progress as each model completes its tests.
 
 **S3 Upload Structure for Benchmarks:**
 
-After the benchmark command completes, outputs are uploaded to S3 preserving the calibrate CLI output structure:
+After the benchmark command completes, **`upload_directory_tree_to_s3()`** uploads the entire calibrate output directory under `outputs/` (same recursive approach as unit tests). That includes run-level **`logs`**, per-model **`logs`** and **`results.log`**, JSON/CSV/leaderboard folders, etc. Leaderboard files are also uploaded under `leaderboard/` (first pass) when present. Example shape (actual folder names depend on calibrate):
 
 ```
 s3://bucket/agent-tests/benchmarks/{task_id}/
-  benchmark_config.json        # Config file with test config + list of models
-  outputs/
-    test_config/
-      anthropic__claude-opus-4.5/
-        results.json
-        metrics.json
-      openai__gpt-5.1/
-        results.json
-        metrics.json
+  benchmark_config.json
   leaderboard/
-    llm_leaderboard.csv
+    llm_leaderboard.csv         # when CLI writes leaderboard here
+  outputs/
+    logs                        # whole-run tee from calibrate
+    leaderboard/                # may mirror local layout
+    <model-folder>/
+      logs
+      results.log
+      results.json
+      metrics.json
 ```
 
-This avoids duplicate uploads (each model uploading everyone's files) and matches the local calibrate output structure.
+On benchmark **failure**, the recursive upload still runs when possible and **`results.results_s3_prefix`** may be set to `agent-tests/benchmarks/{task_id}` so artifacts remain discoverable.
 
 ### Config File Uploads to S3
 
@@ -702,7 +828,7 @@ All job types upload their config files to S3 for reproducibility and debugging.
 - **STT/TTS job details** also store `dataset_id`, `dataset_name`, and `dataset_item_ids` for linking evaluations back to their source dataset
 - **Agent tests**: Contains the full calibrate config (system prompt, tools, test cases, etc.)
 - **Benchmarks**: Contains the calibrate config plus the `models` list being benchmarked
-- **Simulations**: Contains the full calibrate simulation config (personas, scenarios, metrics, tools, etc.)
+- **Simulations**: Contains the full calibrate simulation config (personas, scenarios, evaluators, tools, etc.)
 
 ---
 
@@ -754,7 +880,9 @@ When `model` is passed as a kwarg, it's included in the verification request pay
 
 - Multiple providers can be specified with `-p` (space-separated)
 - The CLI handles parallelization internally
-- Leaderboard is generated automatically in `<output_dir>/leaderboard/`
+- Leaderboard is generated automatically (typically under `<output_dir>/leaderboard/` and/or root CSV/XLSX depending on CLI version)
+- Optional **`--config path.json`** with `{"evaluators":[...]}` — backend writes this when `job.details.evaluators` is non-empty (`build_evaluator_cli_payload()`). Requires a calibrate build that recognizes `--config`.
+- Run-level **`logs`** and per-provider **`logs`** are uploaded to S3 via the mechanisms in **S3 artifacts for STT/TTS eval jobs**
 - No separate `eval` and `leaderboard` commands needed
 
 ### AWS S3
@@ -772,7 +900,7 @@ Required environment variables:
 - `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (optional, falls back to IAM role)
 - `AWS_REGION` - Default: `ap-south-1`
 
-**Uploading files to S3**: All routers use the `upload_file_to_s3()` helper in `utils.py` (never call `s3.upload_file(...)` directly). The helper wraps `boto3`'s `upload_file` and guesses the object's `Content-Type` from the file extension via `mimetypes.guess_type` (e.g. `.json` → `application/json`, `.wav` → `audio/wav`, `.mp3` → `audio/mpeg`). Without this, boto3 defaults to `binary/octet-stream` and browsers force-download the object instead of rendering JSON/audio inline. If the extension is unknown, no `ContentType` is set (S3 falls back to its default). Existing objects uploaded before this helper was introduced still have `binary/octet-stream` and must be fixed via `aws s3 cp ... --metadata-directive REPLACE --content-type ...` if inline rendering is needed.
+**Uploading files to S3**: Routers use `upload_file_to_s3()` for single objects; **`upload_directory_tree_to_s3()`** and **`upload_top_level_files_to_s3()`** wrap it for directory batches (see STT/TTS and agent test sections). Never call `s3.upload_file(...)` directly for ad-hoc uploads. `upload_file_to_s3` guesses `Content-Type` from the file extension via `mimetypes.guess_type` (e.g. `.json` → `application/json`, `.wav` → `audio/wav`, `.mp3` → `audio/mpeg`). Files **without** an extension (e.g. calibrate's `logs`) get no `ContentType` unless extended later. Without `Content-Type`, boto3 defaults to `binary/octet-stream` for some clients. Existing objects uploaded before `Content-Type` guessing still behave as above.
 
 ### Supported Providers
 
@@ -915,10 +1043,12 @@ The `type` is set at creation time via `POST /agents` and returned in all agent 
 
 The `connection_verified` / `benchmark_models_verified` fields are managed by the verify endpoints, can also be set directly via `PUT /agents/{uuid}` (top-level fields on the update request body, merged into config), and are reset automatically when `agent_url` or `agent_headers` change (set to `false`/`null`/`{}` respectively, so the fields are always present in the response). They are stripped when duplicating an agent.
 
-**Simulation Config Generation**: When running simulations, `_build_calibrate_simulation_config()` builds the calibrate config from agent/personas/scenarios/metrics. Key fields always included:
+**Simulation Config Generation**: When running simulations, `_build_calibrate_simulation_config()` in `routers/simulations.py` loads linked rows via **`get_evaluators_for_simulation()`** and passes them through **`build_evaluator_cli_payload()`** (`llm_judge.py`) so the written `simulation_config.json` contains calibrate’s `evaluators` array (not the frozen `metrics` table). Write-time rules for linking evaluators to a simulation are under **Simulations** in **API Endpoints** above.
+
+On **`POST /simulations/{uuid}/run`**, the same ordered evaluator list is persisted on the job as **`details.evaluators`** (minimal UUID-only snapshot) so status and share endpoints can correlate CSV output with **`evaluators.uuid`** without rereading the simulation entity.
 
 - `tools` - Built from linked agent tools (see Tool Configuration Schema below)
-- `evaluation_criteria` - Built from linked metrics (name + description)
+- `evaluators` - CLI payload entries (`name`, `system_prompt`, `judge_model`, `type`, optional `scale_min`/`scale_max` for rating)
 - `settings.agent_speaks_first` - Defaults to `true` if not specified in agent config
 - `settings.max_turns` - Mapped from agent config's `settings.max_assistant_turns` (defaults to `50` if not set)
 
@@ -984,7 +1114,9 @@ The tool type is determined by the `type` field in the tool's `config` column in
 
 ### Test Case Configuration Schema
 
-Tests store conversation history in the `history` field (OpenAI chat message format) and evaluation criteria in the `evaluation` field. Two evaluation types are supported:
+Tests store conversation history in the `history` field (OpenAI chat message format) and evaluation instructions in the `evaluation` field. Two evaluation types are supported. **Rubric content for `response` tests** is no longer a free-form string in the API: new writes use **`test_evaluators`** (pivot) to pin `evaluator_version_id` and optional `variable_values`. At run time, `routers/agent_tests.py` (`_build_calibrate_config` + `build_test_evaluators_payload`) merges linked evaluators into the calibrate config; the stored `config` row may show `evaluation: { "type": "response" }` with no inline `criteria` string.
+
+`_build_calibrate_config(agent, tests)` returns **`(config, evaluators_by_test_name)`** — the second element is the per-test evaluator snapshot (test name → ordered `[{uuid, calibrate_name, output_type, variable_values, scale_min?, scale_max?}]`) used for `judge_results` enrichment at API read time. Both `run_agent_test` and `run_agent_benchmark` call this once at submission and persist the snapshot under `agent_test_jobs.details.evaluators_by_test_name`; the task code unpacks the tuple as `calibrate_config, _ = _build_calibrate_config(agent, tests)` since the snapshot is already on the job. See **Agent Test Job Results Format** for the full snapshot/enrichment contract.
 
 **Tool call evaluation:**
 
@@ -1022,7 +1154,7 @@ Tests store conversation history in the `history` field (OpenAI chat message for
 }
 ```
 
-**Response (criteria) evaluation:**
+**Response evaluation (typical stored `config` after evaluator migration / new creates):**
 
 ```json
 {
@@ -1032,13 +1164,23 @@ Tests store conversation history in the `history` field (OpenAI chat message for
   ],
   "settings": { "language": "english" },
   "evaluation": {
+    "type": "response"
+  }
+}
+```
+
+**Legacy `evaluation.criteria` string** (still in some DB rows; `_build_calibrate_config()` promotes to a synthetic link against the seeded `default-llm-next-reply` evaluator when no `test_evaluators` rows exist):
+
+```json
+{
+  "evaluation": {
     "type": "response",
     "criteria": "The agent should clearly explain the return policy in a helpful and friendly tone"
   }
 }
 ```
 
-The `history` field uses the OpenAI chat messages format with `role` (system/user/assistant/tool), `content`, and optional `tool_calls`/`tool_call_id`/`name` fields. The `evaluation.type` is `"response"` (for LLM judge criteria evaluation) or `"tool_call"` (for expected tool call matching). The optional `settings` field can include language and other test settings. All fields are stored in the test's `config` JSON column and passed through to calibrate as-is by `_build_calibrate_config()`.
+The `history` field uses the OpenAI chat messages format with `role` (system/user/assistant/tool), `content`, and optional `tool_calls`/`tool_call_id`/`name` fields. The `evaluation.type` is `"response"` (LLM judge via linked evaluators) or `"tool_call"` (expected tool call matching). The optional `settings` field can include `language` (and other keys accepted by calibrate). Plain `criteria` strings are legacy; **`POST /tests/bulk` does not accept `criteria`** — it requires **`evaluators`** on each row when `type` is `"response"` (see below).
 
 ### Bulk Test Upload
 
@@ -1055,19 +1197,24 @@ The `history` field uses the OpenAI chat messages format with `role` (system/use
     {
       "name": "test-greeting",
       "conversation_history": [{ "role": "user", "content": "Hello" }],
-      "criteria": "Response should be a polite greeting"
+      "evaluators": [
+        {
+          "evaluator_uuid": "…",
+          "variable_values": { "criteria": "Response should be a polite greeting" }
+        }
+      ]
     }
   ]
 }
 ```
 
 - `type`: `"response"` or `"tool_call"` — stored as `evaluation.type` in the config (same values used in both the API and the stored config)
-- `language`: Optional, applies to all tests — stored as `settings.language` in each test's config
+- `language`: Optional **top-level only** (not per row) — when set, **every** test in the batch gets `config.settings.language`. Per-test language is only possible by creating/updating tests individually with `settings` inside `config`.
 - `agent_uuids`: Optional list of agent UUIDs to link all created tests to. Agents are validated upfront (must exist and be owned by the user) before any tests are created. Linking failures for individual test-agent pairs are surfaced in the response `warnings` array but don't fail the request.
 - Maximum batch size is 500 tests (enforced by `BulkTestUpload.MAX_BATCH_SIZE` in the Pydantic validator)
 - Each test requires a unique `name` — validated both within the batch and against existing tests for the user
 - `conversation_history`: Required, OpenAI chat message format — stored as `history` in the config to match the single-test format
-- `criteria`: Required when `type` is `"response"`
+- `evaluators`: Required when `type` is `"response"` — non-empty list of `EvaluatorRef` (`evaluator_uuid`, optional `variable_values`). **`EvaluatorRef` uses `extra='forbid'`** — unknown keys (e.g. removed `version_uuid`) produce **422**. The stored pivot row pins the evaluator's **live** version at write time (no client-supplied version id). Validated in `tests.py` (`_validate_evaluators`): evaluator must exist, be visible to the user, and have **`evaluator_type == "llm"`** (STT/TTS/simulation evaluators are rejected with 400).
 - `tool_calls`: Required when `type` is `"tool_call"`, array of `{tool, arguments?, accept_any_arguments?}`
 
 All tests are inserted in a single DB transaction — if any name conflicts with an existing test, none are created. The `bulk_create_tests()` function in `db.py` handles the atomic insert with name uniqueness validation. Agent linking happens after test creation via `add_test_to_agent()`. The response includes a `warnings` array (nullable) that reports any agent linking failures, and the `message` reflects the actual number of successfully linked agents rather than the requested count.
@@ -1164,11 +1311,11 @@ The `bulk_remove_tests_from_agent()` function in `db.py` performs a single SQL `
 
 **Helper Functions** (in `utils.py`):
 
-| Function                            | Purpose                                                                           |
-| ----------------------------------- | --------------------------------------------------------------------------------- |
-| `generate_presigned_download_url()` | Generate presigned URL for `get_object` (downloads)                               |
-| `generate_presigned_upload_url()`   | Generate presigned URL for `put_object` (uploads)                                 |
-| `upload_file_to_s3()`               | Upload a local file to S3 with `Content-Type` auto-detected from file extension  |
+| Function                            | Purpose                                                                         |
+| ----------------------------------- | ------------------------------------------------------------------------------- |
+| `generate_presigned_download_url()` | Generate presigned URL for `get_object` (downloads)                             |
+| `generate_presigned_upload_url()`   | Generate presigned URL for `put_object` (uploads)                               |
+| `upload_file_to_s3()`               | Upload a local file to S3 with `Content-Type` auto-detected from file extension |
 
 Presigned URL helpers return `None` on failure, allowing callers to handle errors (skip, fallback to S3 path, raise error).
 

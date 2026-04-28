@@ -28,13 +28,23 @@ from db import (
 from utils import (
     TaskStatus,
     ProviderResult,
+    enrich_evaluator_runs_with_current_names,
     generate_presigned_download_url,
     get_s3_output_config,
     normalize_metrics,
     presign_audio_path,
 )
+
 # Re-use the audio URL helper from simulations (no circular import risk)
-from routers.simulations import _get_audio_urls_from_s3_key
+from routers.simulations import (
+    SimulationEvaluatorRef,
+    apply_simulation_job_evaluator_enrichment,
+    _get_audio_urls_from_s3_key,
+)
+from routers.agent_tests import (
+    _enrich_test_results_with_evaluators,
+    _enrich_model_results_with_evaluators,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +54,7 @@ router = APIRouter(prefix="/public", tags=["public"])
 # ---------------------------------------------------------------------------
 # Response models
 # ---------------------------------------------------------------------------
+
 
 class PublicSTTResponse(BaseModel):
     task_id: str
@@ -94,12 +105,14 @@ class PublicSimulationRunResponse(BaseModel):
     total_simulations: Optional[int] = None
     metrics: Optional[Dict[str, Any]] = None
     simulation_results: Optional[List[Dict[str, Any]]] = None
+    evaluators: Optional[List[SimulationEvaluatorRef]] = None
     error: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _build_tts_provider_results_with_presigned_urls(
     provider_results: List[Dict[str, Any]],
@@ -118,7 +131,9 @@ def _build_tts_provider_results_with_presigned_urls(
             for result_row in provider_result["results"]:
                 if "audio_path" in result_row and result_row["audio_path"]:
                     audio_s3_key = result_row["audio_path"]
-                    if audio_s3_key.startswith("http") or audio_s3_key.startswith("s3://"):
+                    if audio_s3_key.startswith("http") or audio_s3_key.startswith(
+                        "s3://"
+                    ):
                         continue
                     presigned_url = generate_presigned_download_url(audio_s3_key)
                     if presigned_url:
@@ -183,6 +198,7 @@ def _get_simulation_run_name(job: Dict[str, Any]) -> str:
 # Public GET endpoints (no auth)
 # ---------------------------------------------------------------------------
 
+
 @router.get("/stt/{share_token}", response_model=PublicSTTResponse)
 async def get_public_stt(share_token: str):
     """
@@ -205,6 +221,11 @@ async def get_public_stt(share_token: str):
     for pr in provider_results:
         if pr.get("metrics"):
             pr["metrics"] = normalize_metrics(pr["metrics"])
+
+    enrich_evaluator_runs_with_current_names(
+        provider_results,
+        details.get("evaluators") or [],
+    )
 
     # Enrich result rows with presigned audio URLs from the dataset
     audio_paths = details.get("audio_paths", [])
@@ -261,6 +282,11 @@ async def get_public_tts(share_token: str):
         if pr.get("metrics"):
             pr["metrics"] = normalize_metrics(pr["metrics"])
 
+    enrich_evaluator_runs_with_current_names(
+        provider_results,
+        details.get("evaluators") or [],
+    )
+
     # Regenerate presigned audio URLs for completed/failed jobs
     provider_results = _build_tts_provider_results_with_presigned_urls(
         provider_results, status
@@ -292,6 +318,12 @@ async def get_public_test_run(share_token: str):
     task_id = job["uuid"]
     status = job["status"]
     results = job.get("results") or {}
+    details = job.get("details") or {}
+
+    _enrich_test_results_with_evaluators(
+        results.get("test_results"),
+        details.get("evaluators_by_test_name") or {},
+    )
 
     return PublicTestRunResponse(
         task_id=task_id,
@@ -318,6 +350,12 @@ async def get_public_benchmark(share_token: str):
     task_id = job["uuid"]
     status = job["status"]
     results = job.get("results") or {}
+    details = job.get("details") or {}
+
+    _enrich_model_results_with_evaluators(
+        results.get("model_results"),
+        details.get("evaluators_by_test_name") or {},
+    )
 
     return PublicBenchmarkResponse(
         task_id=task_id,
@@ -349,6 +387,10 @@ async def get_public_simulation_run(share_token: str):
         job, simulation_results, status
     )
 
+    evaluators_out, simulation_results = apply_simulation_job_evaluator_enrichment(
+        job.get("details") or {}, simulation_results
+    )
+
     run_name = _get_simulation_run_name(job)
 
     return PublicSimulationRunResponse(
@@ -360,5 +402,6 @@ async def get_public_simulation_run(share_token: str):
         total_simulations=results.get("total_simulations"),
         metrics=results.get("metrics"),
         simulation_results=simulation_results or None,
+        evaluators=evaluators_out,
         error=results.get("error"),
     )
