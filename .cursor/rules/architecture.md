@@ -155,7 +155,7 @@ The `users` table supports two authentication methods. Columns:
 2. **UUIDs**: All entities use UUID as primary identifier (separate from auto-increment id)
 3. **JSON Config**: Complex configurations stored as JSON strings in `config` columns
 4. **Pivot Tables**: Many-to-many relationships use dedicated pivot tables with soft delete support
-5. **Parent `updated_at` cascade**: When child rows are mutated the parent's `updated_at` is bumped in the same transaction. Currently applies to `datasets` ← `dataset_items` (add, update, delete)
+5. **Parent `updated_at` cascade**: When child rows are mutated the parent's `updated_at` is bumped in the same transaction. Currently applies to `datasets` ← `dataset_items` (add, update, delete) and `tests` ← `test_evaluators` (replace evaluator links via `set_test_evaluators()`, including evaluator-only `PUT /tests/{uuid}`)
 6. **Schema migrations**: New columns on existing tables are added via `ALTER TABLE ADD COLUMN` wrapped in `try/except sqlite3.OperationalError: pass` inside `init_db()`. **Gotcha**: SQLite does not allow `DEFAULT CURRENT_TIMESTAMP` (or any non-constant expression) in `ALTER TABLE ADD COLUMN` — the statement silently fails and the `except` swallows it. Always use `DEFAULT NULL` for migration `ADD COLUMN` statements. The `CREATE TABLE` definition can still use `DEFAULT CURRENT_TIMESTAMP` for new databases.
 
 ---

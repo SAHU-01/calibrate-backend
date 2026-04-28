@@ -3342,6 +3342,10 @@ def set_test_evaluators(
                     """,
                     (test_id, evaluator_id, version_id, variable_json),
                 )
+        cursor.execute(
+            "UPDATE tests SET updated_at = CURRENT_TIMESTAMP WHERE uuid = ? AND deleted_at IS NULL",
+            (test_id,),
+        )
         conn.commit()
 
 
