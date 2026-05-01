@@ -38,7 +38,10 @@ from db import (
     get_job,
     update_job,
 )
-from llm_judge import build_evaluator_cli_payload
+from llm_judge import (
+    build_evaluator_cli_payload,
+    build_evaluator_cli_payload_unrendered,
+)
 from utils import (
     TaskStatus,
     capture_exception_to_sentry,
@@ -198,21 +201,26 @@ def _build_stt_dataset(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _build_llm_dataset(
-    items: List[Dict[str, Any]], evaluator_names: List[str]
+    items: List[Dict[str, Any]], evaluators_resolved: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
     """LLM --eval-only: [{test_case: {id, history, evaluation}, output: {response, tool_calls}}].
 
     Annotation convention for payload (response-mode only — tool-call eval is
     not exposed via this endpoint today):
-      { "chat_history": [...], "agent_response": "...", "tool_calls"?: [...] }
-    The set of evaluators requested for the run becomes the
-    `evaluation.criteria` references on every test case.
+      { "chat_history": [...], "agent_response": "...", "tool_calls"?: [...],
+        "evaluator_variables"?: { "<evaluator_uuid>": { "<var>": <value>, ... } } }
+
+    `evaluator_variables` lets each item supply per-evaluator `{{variable}}`
+    values for evaluators whose prompts contain placeholders. Values are
+    threaded into each test case's `evaluation.criteria[].arguments` so
+    calibrate substitutes them at judge time. Missing entries → no
+    arguments → calibrate falls back to the placeholder (or its declared
+    default if any).
     """
-    if not evaluator_names:
+    if not evaluators_resolved:
         raise DatasetBuildError(
             "LLM --eval-only requires at least one evaluator (criteria)"
         )
-    criteria_refs = [{"name": n} for n in evaluator_names]
     out: List[Dict[str, Any]] = []
     for it in items:
         payload = _payload_dict(it)
@@ -228,6 +236,19 @@ def _build_llm_dataset(
             raise DatasetBuildError(
                 f"Item {it['uuid']}: `tool_calls` must be a list if provided"
             )
+        per_evaluator_vars = payload.get("evaluator_variables") or {}
+        if not isinstance(per_evaluator_vars, dict):
+            raise DatasetBuildError(
+                f"Item {it['uuid']}: `evaluator_variables` must be a dict "
+                "keyed by evaluator UUID"
+            )
+        criteria_refs: List[Dict[str, Any]] = []
+        for ev in evaluators_resolved:
+            ref: Dict[str, Any] = {"name": ev["name"]}
+            args = per_evaluator_vars.get(ev["uuid"]) or {}
+            if args:
+                ref["arguments"] = args
+            criteria_refs.append(ref)
         out.append(
             {
                 "test_case": {
@@ -235,7 +256,7 @@ def _build_llm_dataset(
                     "history": history,
                     "evaluation": {
                         "type": "response",
-                        "criteria": list(criteria_refs),
+                        "criteria": criteria_refs,
                     },
                 },
                 "output": {"response": str(response), "tool_calls": tool_calls},
@@ -263,12 +284,12 @@ def _build_simulation_dataset(items: List[Dict[str, Any]]) -> List[Dict[str, Any
 def build_dataset_for_task_type(
     task_type: str,
     items: List[Dict[str, Any]],
-    evaluator_names: List[str],
+    evaluators_resolved: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     if task_type == "stt":
         return _build_stt_dataset(items)
     if task_type == "llm":
-        return _build_llm_dataset(items, evaluator_names)
+        return _build_llm_dataset(items, evaluators_resolved)
     if task_type == "simulation":
         return _build_simulation_dataset(items)
     raise DatasetBuildError(
@@ -338,16 +359,28 @@ def _read_config_evaluators_map(output_dir: Path) -> Dict[str, str]:
 
 def _coerce_score(raw: Any, output_type: str) -> Any:
     """Coerce a raw value out of CSV/JSON into the right Python type per
-    output_type. Falls back to passthrough on unparseable input."""
+    output_type. Falls back to passthrough on unparseable input.
+
+    Binary handling has to cope with the full range of representations
+    calibrate emits across its three flows: bool, "True"/"False" strings,
+    "1"/"0" strings, "1.0"/"0.0" stringified floats (simulation
+    `evaluation_results.csv` does this), and bare numerics.
+    """
     if output_type == "binary":
         if isinstance(raw, bool):
             return raw
+        if isinstance(raw, (int, float)):
+            return bool(raw)
         s = str(raw).strip().lower()
-        if s in ("true", "1", "yes", "pass"):
+        if s in ("true", "yes", "pass"):
             return True
-        if s in ("false", "0", "no", "fail"):
+        if s in ("false", "no", "fail"):
             return False
-        return raw
+        # Numeric strings — covers "1", "0", "1.0", "0.0", "1.00", etc.
+        try:
+            return bool(float(s))
+        except (TypeError, ValueError):
+            return raw
     if output_type == "rating":
         try:
             return int(float(raw))
@@ -723,14 +756,27 @@ def _run_job(
             output_dir_for_partial = output_dir
 
             # 1. Dataset.
-            evaluator_names = [ev["name"] for ev in evaluators_resolved]
-            dataset = build_dataset_for_task_type(task_type, items, evaluator_names)
+            dataset = build_dataset_for_task_type(
+                task_type, items, evaluators_resolved
+            )
             dataset_path = input_dir / "dataset.json"
             with open(dataset_path, "w", encoding="utf-8") as f:
                 json.dump(dataset, f, ensure_ascii=False)
 
-            # 2. Config (evaluators only — same shape across all eval-only modes).
-            evaluator_payload = build_evaluator_cli_payload(evaluators_resolved)
+            # 2. Config (evaluators only). For LLM tasks, leave {{variable}}
+            # placeholders unrendered so calibrate substitutes per-test
+            # `criteria[].arguments` from each item's `evaluator_variables`.
+            # STT/simulation flows have no per-row arguments mechanism, so we
+            # pre-render the evaluator's own `variable_values` (typically empty
+            # in the annotation flow).
+            if task_type == "llm":
+                evaluator_payload = build_evaluator_cli_payload_unrendered(
+                    evaluators_resolved
+                )
+            else:
+                evaluator_payload = build_evaluator_cli_payload(
+                    evaluators_resolved
+                )
             config_path = input_dir / "config.json"
             with open(config_path, "w", encoding="utf-8") as f:
                 json.dump({"evaluators": evaluator_payload}, f, ensure_ascii=False)

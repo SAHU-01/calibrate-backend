@@ -1,3 +1,5 @@
+from typing import Any, Dict, Optional
+
 from fastapi import APIRouter, Depends, Query
 
 from db import (
@@ -11,6 +13,7 @@ from annotation_metrics import (
     aggregate_human_evaluator_agreement,
     trend_series,
     trend_series_human_evaluator,
+    filter_runs_to_live_versions,
 )
 
 
@@ -33,32 +36,45 @@ async def agreement_trend(
         one per evaluator that's been run at least once on this account's data.
     """
     annotations = get_annotations_for_user(user_id)
-    runs = get_evaluator_runs_for_user(user_id)
+    raw_runs = get_evaluator_runs_for_user(user_id)
 
     hh_current, hh_pairs = aggregate_agreement(annotations)
     hh_series = trend_series(annotations, bucket=bucket, days=days)
 
     # Distinct evaluator_ids that have produced runs on the user's data — that's
     # the natural set to include in the account-wide rollup. Names are resolved
-    # live from the evaluators table so renames show up.
+    # live from the evaluators table so renames show up. We also resolve each
+    # evaluator's live_version_id to filter runs down to live-version only;
+    # non-live experimental runs stay in the DB but don't contribute to the
+    # account-wide "evaluator agreement" number.
     evaluator_ids = []
     seen = set()
-    for r in runs:
+    for r in raw_runs:
         ev_id = r.get("evaluator_id")
         if ev_id and ev_id not in seen:
             seen.add(ev_id)
             evaluator_ids.append(ev_id)
+
+    evaluator_meta: Dict[str, Dict[str, Any]] = {}
+    live_version_by_evaluator: Dict[str, Optional[str]] = {}
+    for ev_id in evaluator_ids:
+        ev = get_evaluator(ev_id)
+        evaluator_meta[ev_id] = ev or {}
+        live_version_by_evaluator[ev_id] = (ev or {}).get("live_version_id")
+
+    runs = filter_runs_to_live_versions(raw_runs, live_version_by_evaluator)
+
     series_by_id = trend_series_human_evaluator(
         annotations, runs, evaluator_ids, bucket=bucket, days=days
     )
     evaluators_block = []
     for ev_id in evaluator_ids:
-        ev = get_evaluator(ev_id)
+        ev = evaluator_meta.get(ev_id) or {}
         cur, pairs = aggregate_human_evaluator_agreement(annotations, runs, ev_id)
         evaluators_block.append(
             {
                 "evaluator_id": ev_id,
-                "name": ev.get("name") if ev else None,
+                "name": ev.get("name"),
                 "current": cur,
                 "pair_count": pairs,
                 "series": series_by_id.get(ev_id, []),

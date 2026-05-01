@@ -135,6 +135,28 @@ def build_evaluator_cli_payload(
     return payload
 
 
+def build_evaluator_cli_payload_unrendered(
+    evaluators: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Same shape as `build_evaluator_cli_payload`, but leaves `{{variable}}`
+    placeholders in the system_prompt UNRENDERED so calibrate substitutes per
+    test case from each criterion's `arguments`. The rubric block (per-level
+    scale descriptions) is still appended.
+
+    Use for the LLM annotation eval flow, where each item supplies its own
+    `payload.evaluator_variables[<evaluator_uuid>] = {var: value}` and those
+    values become per-test `criteria[].arguments`.
+    """
+    payload = []
+    for ev in evaluators:
+        rendered_prompt = ev.get("system_prompt", "")
+        rubric = _format_scale_rubric(ev.get("output_config"))
+        if rubric:
+            rendered_prompt = rendered_prompt.rstrip() + rubric
+        payload.append(_calibrate_evaluator_def(ev, rendered_prompt))
+    return payload
+
+
 def build_test_evaluators_payload(
     tests_with_evaluators: List[Dict[str, Any]],
 ) -> tuple[List[Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:

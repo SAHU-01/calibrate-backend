@@ -100,6 +100,35 @@ def _slot_key(annotation: Dict[str, Any]) -> Tuple[str, Optional[str]]:
     return (annotation["item_id"], annotation.get("evaluator_id"))
 
 
+def filter_runs_to_live_versions(
+    runs: Iterable[Dict[str, Any]],
+    live_version_by_evaluator: Dict[str, Optional[str]],
+) -> List[Dict[str, Any]]:
+    """Drop evaluator_runs whose `evaluator_version_id` doesn't match the
+    evaluator's current live version.
+
+    Used so that experimental/non-live runs don't silently contaminate the
+    "evaluator agreement" surfaced anywhere in the API. When a user says
+    "evaluator agreement" without qualifying a version, they mean the live
+    version's agreement.
+
+    Runs for evaluators with no live version (or evaluator_id missing in the
+    map) are dropped — without a live version there's no contribution to
+    "live agreement" by definition.
+    """
+    out: List[Dict[str, Any]] = []
+    for r in runs:
+        ev_id = r.get("evaluator_id")
+        if not ev_id:
+            continue
+        live_v = live_version_by_evaluator.get(ev_id)
+        if not live_v:
+            continue
+        if r.get("evaluator_version_id") == live_v:
+            out.append(r)
+    return out
+
+
 def aggregate_agreement(
     annotations: Iterable[Dict[str, Any]],
 ) -> Tuple[Optional[float], int]:
