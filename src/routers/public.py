@@ -28,6 +28,15 @@ from db import (
     get_agent_test_job_by_share_token,
     get_simulation_job_by_share_token,
     get_simulation_jobs_for_simulation,
+    get_annotation_job_by_token,
+    get_annotation_task,
+    get_evaluator_ids_for_job,
+    get_evaluators_for_job,
+    get_annotator,
+    get_job_items,
+    get_annotations_for_job,
+    upsert_annotation,
+    update_annotation_job_status,
 )
 from utils import (
     TaskStatus,
@@ -495,3 +504,187 @@ async def get_public_simulation_run(share_token: str):
         evaluators=evaluators_out,
         error=results.get("error"),
     )
+
+
+# ---------------------------------------------------------------------------
+# Annotation jobs (public, token-only)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_public_annotation_job(token: str) -> Dict[str, Any]:
+    """Fetch a job by its public_token, ensuring it's a real shareable link
+    (not a CSV-import sentinel). Raises 404 otherwise."""
+    job = get_annotation_job_by_token(token)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
+@router.get("/annotation-jobs/{token}")
+def get_public_annotation_job(token: str):
+    """Everything an annotator needs to render their job page:
+
+    - Job + status
+    - Annotator's name (so the page can greet them)
+    - Task type + linked evaluators (drives form rendering: binary toggle vs
+      rating scale, plus per-evaluator name/description/output_config)
+    - Items (with their parsed `payload`)
+    - Existing annotations on this job (so the page can resume in-progress work)
+    """
+    job = _resolve_public_annotation_job(token)
+    task = get_annotation_task(job["task_id"])
+    if not task:
+        raise HTTPException(status_code=404, detail="Job not found")
+    annotator = get_annotator(job["annotator_id"])
+    # Read the SNAPSHOTTED evaluator set so the labelling form columns match
+    # exactly what was assigned at job creation, regardless of subsequent
+    # link/unlink on the parent task.
+    evaluators = get_evaluators_for_job(job["uuid"])
+    # Enrich each evaluator with the live version's rubric, variable specs,
+    # and derived scale bounds so the FE has everything it needs to render
+    # the labelling form without a second roundtrip:
+    #   - `output_config` → scale entries (name/description/color/value)
+    #   - `scale_min` / `scale_max` → numeric bounds for rating widgets;
+    #     null for binary
+    #   - `variables` → list of `{name, default?, description?}` placeholder
+    #     specs declared by the prompt. Per-item variable values live on
+    #     `items[].payload.evaluator_variables[<evaluator_uuid>]`; the FE
+    #     pairs them with these specs to display the substituted prompt.
+    from llm_judge import _scale_bounds  # local to avoid module-load cycle
+
+    for ev in evaluators:
+        version = (
+            get_evaluator_version(ev["live_version_id"])
+            if ev.get("live_version_id")
+            else None
+        )
+        output_config = version.get("output_config") if version else None
+        scale_min, scale_max = _scale_bounds(output_config)
+        ev["output_config"] = output_config
+        ev["scale_min"] = scale_min
+        ev["scale_max"] = scale_max
+        ev["variables"] = version.get("variables") if version else None
+    items = get_job_items(job["uuid"])
+    annotations = get_annotations_for_job(job["uuid"])
+
+    return {
+        "job": {
+            "uuid": job["uuid"],
+            "status": job["status"],
+            "created_at": job["created_at"],
+            "completed_at": job.get("completed_at"),
+        },
+        "annotator": {
+            "uuid": annotator["uuid"] if annotator else None,
+            "name": annotator["name"] if annotator else None,
+        },
+        "task": {
+            "uuid": task["uuid"],
+            "name": task["name"],
+            "type": task["type"],
+            "description": task.get("description"),
+        },
+        "evaluators": evaluators,
+        "items": items,
+        "annotations": annotations,
+    }
+
+
+class PublicAnnotationEntry(BaseModel):
+    evaluator_id: Optional[str] = None  # None = row-level overall annotation
+    value: Optional[Dict[str, Any]] = None
+
+
+class PublicAnnotationUpsertRequest(BaseModel):
+    item_id: str
+    annotations: List[PublicAnnotationEntry]
+
+
+@router.post("/annotation-jobs/{token}/annotations")
+def upsert_public_annotations(token: str, payload: PublicAnnotationUpsertRequest):
+    """Upsert all judgements for one item in one call. Pass one entry per
+    evaluator (plus optionally one with `evaluator_id = null` for a row-level
+    overall annotation).
+
+    Side effects:
+      - The job auto-flips from `pending` -> `in_progress` on the first save.
+      - After saving, the job auto-flips to `completed` (with `completed_at`)
+        when every item in the job has annotations for every evaluator linked
+        to the task. Row-level annotations are NOT required.
+    """
+    job = _resolve_public_annotation_job(token)
+    if not payload.annotations:
+        raise HTTPException(
+            status_code=400, detail="annotations must be non-empty"
+        )
+
+    # Validate against the job's snapshotted items (annotation_job_items), not
+    # the source annotation_items row — the source may have been edited or
+    # soft-deleted after the job was created, but the snapshot is what the
+    # annotator is actually labeling.
+    job_items = get_job_items(job["uuid"])
+    if not any(it["uuid"] == payload.item_id for it in job_items):
+        raise HTTPException(status_code=404, detail="Item not found in this job")
+
+    # Validate that every non-null `evaluator_id` is in the job's snapshotted
+    # evaluator set (NOT the task's current linked set — the contract is
+    # frozen at job creation). Without this, a token holder could upsert
+    # annotations against any evaluator UUID — polluting downstream agreement
+    # aggregates that read `annotations` joined through `annotation_jobs`.
+    # `evaluator_id IS NULL` is the row-level overall annotation case and is
+    # always allowed.
+    linked_evaluator_ids = set(get_evaluator_ids_for_job(job["uuid"]))
+    invalid = [
+        entry.evaluator_id
+        for entry in payload.annotations
+        if entry.evaluator_id is not None
+        and entry.evaluator_id not in linked_evaluator_ids
+    ]
+    if invalid:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Evaluator(s) not linked to this task: {invalid}",
+        )
+
+    saved_uuids: List[str] = []
+    for entry in payload.annotations:
+        annotation_uuid = upsert_annotation(
+            job_id=job["uuid"],
+            item_id=payload.item_id,
+            evaluator_id=entry.evaluator_id,
+            value=entry.value,
+        )
+        saved_uuids.append(annotation_uuid)
+
+    if job["status"] == "pending":
+        update_annotation_job_status(job["uuid"], "in_progress")
+
+    # Auto-complete: every (item, evaluator) slot in this job must have a row.
+    # We re-check on every save (including post-completion edits) so the
+    # status remains accurate. `completed_at` is preserved on subsequent
+    # edits — it marks the first time the job was fully filled.
+    # Both the items AND the evaluator set are read from the job's snapshot
+    # so post-creation link/unlink on the parent task can't shift the
+    # completion bar under the annotator.
+    job_items = get_job_items(job["uuid"])
+    evaluator_ids = get_evaluator_ids_for_job(job["uuid"])
+    annotated_pairs = {
+        (a["item_id"], a.get("evaluator_id"))
+        for a in get_annotations_for_job(job["uuid"])
+        if a.get("evaluator_id") is not None
+    }
+    expected_pairs = {
+        (it["uuid"], ev_id) for it in job_items for ev_id in evaluator_ids
+    }
+    completed = bool(expected_pairs) and expected_pairs.issubset(annotated_pairs)
+    if completed and job["status"] != "completed":
+        update_annotation_job_status(
+            job["uuid"], "completed", set_completed_at=True
+        )
+
+    final_status = "completed" if completed else "in_progress"
+    return {
+        "saved": saved_uuids,
+        "count": len(saved_uuids),
+        "status": final_status,
+    }

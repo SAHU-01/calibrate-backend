@@ -45,12 +45,14 @@ from routers.agent_tests import router as agent_tests_router
 from routers.personas import router as personas_router
 from routers.scenarios import router as scenarios_router
 from routers.evaluators import router as evaluators_router
-from routers.api_keys import router as api_keys_router
 from routers.simulations import router as simulations_router
 from routers.jobs import router as jobs_router
 from routers.datasets import router as datasets_router
 from routers.user_limits import router as user_limits_router
 from routers.public import router as public_router
+from routers.annotation_tasks import router as annotation_tasks_router
+from routers.annotators import router as annotators_router
+from routers.annotation_agreement import router as annotation_agreement_router
 from utils import (
     generate_presigned_upload_url,
     get_s3_output_config,
@@ -127,11 +129,13 @@ app.include_router(agent_tests_router)
 app.include_router(personas_router)
 app.include_router(scenarios_router)
 app.include_router(evaluators_router)
-app.include_router(api_keys_router)
 app.include_router(simulations_router)
 app.include_router(jobs_router)
 app.include_router(datasets_router)
 app.include_router(user_limits_router)
+app.include_router(annotation_tasks_router)
+app.include_router(annotators_router)
+app.include_router(annotation_agreement_router)
 # Public (no-auth) sharing endpoints — must be registered without any auth dependency
 app.include_router(public_router)
 
