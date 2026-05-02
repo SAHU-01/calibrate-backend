@@ -598,6 +598,26 @@ def upsert_public_annotations(token: str, payload: PublicAnnotationUpsertRequest
     if not any(it["uuid"] == payload.item_id for it in job_items):
         raise HTTPException(status_code=404, detail="Item not found in this job")
 
+    # Validate that every non-null `evaluator_id` is currently linked to the
+    # task. Without this, a token holder could upsert annotations against any
+    # evaluator UUID — polluting downstream agreement aggregates that read
+    # `annotations` joined through `annotation_jobs.task_id`. `evaluator_id IS
+    # NULL` is the row-level overall annotation case and is always allowed.
+    linked_evaluator_ids = {
+        e["uuid"] for e in get_evaluators_for_annotation_task(job["task_id"])
+    }
+    invalid = [
+        entry.evaluator_id
+        for entry in payload.annotations
+        if entry.evaluator_id is not None
+        and entry.evaluator_id not in linked_evaluator_ids
+    ]
+    if invalid:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Evaluator(s) not linked to this task: {invalid}",
+        )
+
     saved_uuids: List[str] = []
     for entry in payload.annotations:
         annotation_uuid = upsert_annotation(

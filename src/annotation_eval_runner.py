@@ -183,7 +183,42 @@ def _resolve_evaluator_dicts(
                 "_evaluator_version_id": version_uuid,
             }
         )
+    _dedupe_evaluator_names(resolved)
     return resolved
+
+
+def _dedupe_evaluator_names(evaluators: List[Dict[str, Any]]) -> None:
+    """Mutate `evaluators` so every `name` is unique within the list.
+
+    Calibrate keys its result columns / JSON entries by evaluator name. If two
+    linked evaluators share the same name, calibrate's outputs collapse them
+    and our results parser silently attributes everything to one UUID. We
+    sidestep this the same way `build_test_evaluators_payload` does for the
+    regular LLM-tests flow: when a name collides, suffix `-{uuid8}`.
+
+    Mutates in place — downstream consumers (dataset builder, calibrate
+    payload builder, results parser, stored job details) all see the same
+    deduped name. In the common case where names are already unique this is
+    a no-op.
+    """
+    used: set = set()
+    for ev in evaluators:
+        base = ev.get("name") or ev["uuid"]
+        name = base
+        if name in used:
+            name = f"{base}-{ev['uuid'][:8]}"
+            # Extreme edge case: even the suffixed form collides (two evaluators
+            # with both same name AND same first-8 uuid chars). Append more.
+            extra = 9
+            while name in used and extra <= len(ev["uuid"]):
+                name = f"{base}-{ev['uuid'][:extra]}"
+                extra += 1
+            logger.warning(
+                f"[annotation-eval] evaluator name collision on {base!r}; "
+                f"renaming evaluator {ev['uuid']} → {name!r} for this run"
+            )
+        used.add(name)
+        ev["name"] = name
 
 
 # ---------------------------------------------------------------------------

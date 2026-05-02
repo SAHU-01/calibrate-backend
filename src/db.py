@@ -5681,6 +5681,14 @@ def create_annotation_job(
     or the auto-completion check."""
     if not item_uuids:
         raise ValueError("item_uuids must be non-empty")
+    if len(item_uuids) != len(set(item_uuids)):
+        # Belt-and-braces guard for the route's own dedup check. Without it a
+        # duplicate item_uuid would violate UNIQUE(job_id, item_id) on
+        # annotation_job_items and bubble up as a 500.
+        raise ValueError(
+            f"item_uuids contains duplicates: "
+            f"{sorted({u for u in item_uuids if item_uuids.count(u) > 1})}"
+        )
     job_uuid = str(uuid.uuid4())
     with get_db_connection() as conn:
         cursor = conn.cursor()

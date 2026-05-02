@@ -412,6 +412,20 @@ async def create_jobs(
         )
     if not payload.item_ids:
         raise HTTPException(status_code=400, detail="item_ids must be non-empty")
+    if len(payload.item_ids) != len(set(payload.item_ids)):
+        # Duplicate item_ids would violate UNIQUE(job_id, item_id) on
+        # annotation_job_items and surface as a 500. Surface as a clean 400.
+        seen: set = set()
+        duplicates: List[str] = []
+        for i in payload.item_ids:
+            if i in seen:
+                duplicates.append(i)
+            else:
+                seen.add(i)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Duplicate item_ids in request: {sorted(set(duplicates))}",
+        )
 
     # Validate annotators (all up front, before any insert).
     annotators_by_id: Dict[str, Dict[str, Any]] = {}
