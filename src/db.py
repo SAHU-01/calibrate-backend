@@ -5362,6 +5362,29 @@ def get_all_annotation_tasks(user_id: str) -> List[Dict[str, Any]]:
         return [_parse_annotation_task_row(r) for r in cursor.fetchall()]
 
 
+def get_annotation_tasks_by_uuids(
+    task_uuids: List[str],
+) -> Dict[str, Dict[str, Any]]:
+    """Bulk variant of `get_annotation_task` — single query for many UUIDs.
+    Returns `{uuid: task_row}`; missing or soft-deleted UUIDs are omitted."""
+    if not task_uuids:
+        return {}
+    unique_uuids = list({u for u in task_uuids if u})
+    if not unique_uuids:
+        return {}
+    placeholders = ",".join("?" for _ in unique_uuids)
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT * FROM annotation_tasks "
+            f"WHERE uuid IN ({placeholders}) AND deleted_at IS NULL",
+            unique_uuids,
+        )
+        return {
+            row["uuid"]: _parse_annotation_task_row(row) for row in cursor.fetchall()
+        }
+
+
 def update_annotation_task(
     task_uuid: str,
     name: Optional[str] = None,

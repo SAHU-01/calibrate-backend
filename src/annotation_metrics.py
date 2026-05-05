@@ -448,6 +448,135 @@ def trend_series_human_evaluator(
     return out
 
 
+def trend_series_evaluator_breakdown(
+    annotations: List[Dict[str, Any]],
+    runs: List[Dict[str, Any]],
+    evaluator_id: str,
+    version_ids: List[str],
+    task_ids: List[str],
+    bucket: str,
+    days: int,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Single-pass cumulative agreement trend for one evaluator, broken down by
+    version and task simultaneously.
+
+    `runs` must carry a `task_id` field (as returned by
+    `get_evaluator_runs_for_evaluator_user_scoped`).
+
+    Returns:
+        {
+            "overall":    [{bucket_start, bucket_end, agreement, pair_count}, ...],
+            "by_version": {version_id: [series ...]},
+            "by_task":    {task_id:    [series ...]},
+        }
+    """
+    buckets = build_buckets(bucket, days, now=now)
+
+    def _empty() -> List[Dict[str, Any]]:
+        return [
+            {
+                "bucket_start": _fmt_ts(s),
+                "bucket_end": _fmt_ts(e),
+                "agreement": None,
+                "pair_count": 0,
+            }
+            for (s, e) in buckets
+        ]
+
+    if not annotations and not runs:
+        return {
+            "overall": _empty(),
+            "by_version": {vid: _empty() for vid in version_ids},
+            "by_task": {tid: _empty() for tid in task_ids},
+        }
+
+    parsed_ann: List[Tuple[datetime, Dict[str, Any]]] = []
+    for a in annotations:
+        ts = a.get("updated_at") or a.get("created_at")
+        if not ts:
+            continue
+        try:
+            parsed_ann.append((_parse_ts(ts), a))
+        except ValueError:
+            continue
+    parsed_ann.sort(key=lambda x: x[0])
+
+    parsed_runs: List[Tuple[datetime, Dict[str, Any]]] = []
+    for r in runs:
+        ts = r.get("completed_at") or r.get("created_at")
+        if not ts:
+            continue
+        try:
+            parsed_runs.append((_parse_ts(ts), r))
+        except ValueError:
+            continue
+    parsed_runs.sort(key=lambda x: x[0])
+
+    version_id_set = set(version_ids)
+    task_id_set = set(task_ids)
+
+    # Pre-separated visible accumulators — populated as we advance through
+    # buckets so each aggregate call works on an already-filtered slice.
+    visible_ann_all: List[Dict[str, Any]] = []
+    visible_ann_by_task: Dict[str, List[Dict[str, Any]]] = {tid: [] for tid in task_ids}
+    visible_runs_all: List[Dict[str, Any]] = []
+    visible_runs_by_version: Dict[str, List[Dict[str, Any]]] = {vid: [] for vid in version_ids}
+    visible_runs_by_task: Dict[str, List[Dict[str, Any]]] = {tid: [] for tid in task_ids}
+
+    out_overall: List[Dict[str, Any]] = []
+    out_by_version: Dict[str, List[Dict[str, Any]]] = {vid: [] for vid in version_ids}
+    out_by_task: Dict[str, List[Dict[str, Any]]] = {tid: [] for tid in task_ids}
+
+    ann_idx = 0
+    run_idx = 0
+
+    for start, end in buckets:
+        while ann_idx < len(parsed_ann) and parsed_ann[ann_idx][0] <= end:
+            a = parsed_ann[ann_idx][1]
+            visible_ann_all.append(a)
+            tid = a.get("task_id")
+            if tid in task_id_set:
+                visible_ann_by_task[tid].append(a)
+            ann_idx += 1
+
+        while run_idx < len(parsed_runs) and parsed_runs[run_idx][0] <= end:
+            r = parsed_runs[run_idx][1]
+            visible_runs_all.append(r)
+            vid = r.get("evaluator_version_id")
+            if vid in version_id_set:
+                visible_runs_by_version[vid].append(r)
+            tid = r.get("task_id")
+            if tid in task_id_set:
+                visible_runs_by_task[tid].append(r)
+            run_idx += 1
+
+        meta = {"bucket_start": _fmt_ts(start), "bucket_end": _fmt_ts(end)}
+
+        agree, pairs = aggregate_human_evaluator_agreement(
+            visible_ann_all, visible_runs_all, evaluator_id
+        )
+        out_overall.append({**meta, "agreement": agree, "pair_count": pairs})
+
+        for vid in version_ids:
+            agree, pairs = aggregate_human_evaluator_agreement(
+                visible_ann_all, visible_runs_by_version[vid], evaluator_id
+            )
+            out_by_version[vid].append({**meta, "agreement": agree, "pair_count": pairs})
+
+        for tid in task_ids:
+            agree, pairs = aggregate_human_evaluator_agreement(
+                visible_ann_by_task[tid], visible_runs_by_task[tid], evaluator_id
+            )
+            out_by_task[tid].append({**meta, "agreement": agree, "pair_count": pairs})
+
+    return {
+        "overall": out_overall,
+        "by_version": out_by_version,
+        "by_task": out_by_task,
+    }
+
+
 def aggregate_agreement_for_annotator(
     annotations: Iterable[Dict[str, Any]],
     annotator_id: str,

@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from db import (
     get_annotation_task,
+    get_annotation_tasks_by_uuids,
     get_annotations_for_task,
     get_annotations_for_user,
     get_evaluator,
@@ -17,9 +18,10 @@ from auth_utils import get_current_user_id
 from annotation_metrics import (
     aggregate_agreement,
     aggregate_human_evaluator_agreement,
-    trend_series,
-    trend_series_human_evaluator,
     filter_runs_to_live_versions,
+    trend_series,
+    trend_series_evaluator_breakdown,
+    trend_series_human_evaluator,
 )
 
 
@@ -139,34 +141,44 @@ async def evaluator_agreement_trend(
         evaluator_uuid, user_id, task_id=task_id, version_id=version_id
     )
 
-    # ── Overall ──────────────────────────────────────────────────────────────
-    overall_cur, overall_pairs = aggregate_human_evaluator_agreement(
-        annotations, runs, evaluator_uuid
-    )
-    overall_series = trend_series_human_evaluator(
-        annotations, runs, [evaluator_uuid], bucket=bucket, days=days
-    ).get(evaluator_uuid, [])
-
-    # ── Per-version breakdown ─────────────────────────────────────────────────
-    all_versions = get_evaluator_versions(evaluator_uuid)
+    all_versions = get_evaluator_versions(evaluator_uuid) if runs else []
     version_number_by_id = {v["uuid"]: v["version_number"] for v in all_versions}
     live_version_id = evaluator.get("live_version_id")
 
     seen_versions: List[str] = []
     seen_v_set: set = set()
+    seen_tasks: List[str] = []
+    seen_t_set: set = set()
     for r in runs:
         vid = r.get("evaluator_version_id")
         if vid and vid not in seen_v_set:
             seen_v_set.add(vid)
             seen_versions.append(vid)
+        tid = r.get("task_id")
+        if tid and tid not in seen_t_set:
+            seen_t_set.add(tid)
+            seen_tasks.append(tid)
+
+    breakdown = trend_series_evaluator_breakdown(
+        annotations, runs, evaluator_uuid,
+        version_ids=seen_versions,
+        task_ids=seen_tasks,
+        bucket=bucket,
+        days=days,
+    )
+
+    def _last(series: List[Dict[str, Any]]) -> tuple:
+        if not series:
+            return None, 0
+        last = series[-1]
+        return last["agreement"], last["pair_count"]
+
+    task_meta_by_id = get_annotation_tasks_by_uuids(seen_tasks)
 
     versions_block: List[Dict[str, Any]] = []
     for vid in seen_versions:
-        v_runs = [r for r in runs if r.get("evaluator_version_id") == vid]
-        cur, pairs = aggregate_human_evaluator_agreement(annotations, v_runs, evaluator_uuid)
-        series = trend_series_human_evaluator(
-            annotations, v_runs, [evaluator_uuid], bucket=bucket, days=days
-        ).get(evaluator_uuid, [])
+        series = breakdown["by_version"][vid]
+        cur, pairs = _last(series)
         versions_block.append(
             {
                 "version_id": vid,
@@ -178,24 +190,11 @@ async def evaluator_agreement_trend(
             }
         )
 
-    # ── Per-task breakdown ────────────────────────────────────────────────────
-    seen_tasks: List[str] = []
-    seen_t_set: set = set()
-    for r in runs:
-        tid = r.get("task_id")
-        if tid and tid not in seen_t_set:
-            seen_t_set.add(tid)
-            seen_tasks.append(tid)
-
     tasks_block: List[Dict[str, Any]] = []
     for tid in seen_tasks:
-        t_runs = [r for r in runs if r.get("task_id") == tid]
-        t_annotations = [a for a in annotations if a.get("task_id") == tid]
-        cur, pairs = aggregate_human_evaluator_agreement(t_annotations, t_runs, evaluator_uuid)
-        series = trend_series_human_evaluator(
-            t_annotations, t_runs, [evaluator_uuid], bucket=bucket, days=days
-        ).get(evaluator_uuid, [])
-        task_meta = get_annotation_task(tid) or {}
+        series = breakdown["by_task"][tid]
+        cur, pairs = _last(series)
+        task_meta = task_meta_by_id.get(tid) or {}
         tasks_block.append(
             {
                 "task_id": tid,
@@ -205,6 +204,9 @@ async def evaluator_agreement_trend(
                 "series": series,
             }
         )
+
+    overall_series = breakdown["overall"]
+    overall_cur, overall_pairs = _last(overall_series)
 
     return {
         "evaluator_id": evaluator_uuid,
