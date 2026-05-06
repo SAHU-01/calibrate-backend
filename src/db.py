@@ -603,9 +603,7 @@ def init_db():
         # link row. After this column is added, all assigned items live as
         # frozen copies — edits/deletes on the source item don't affect jobs.
         try:
-            cursor.execute(
-                "ALTER TABLE annotation_job_items ADD COLUMN payload TEXT"
-            )
+            cursor.execute("ALTER TABLE annotation_job_items ADD COLUMN payload TEXT")
         except sqlite3.OperationalError:
             pass
 
@@ -840,7 +838,7 @@ def init_db():
 
 # ============ Default judge models (mirror calibrate defaults) ============
 DEFAULT_TEXT_JUDGE_MODEL = "openai/gpt-5.4-mini"
-DEFAULT_AUDIO_JUDGE_MODEL = "google/gemini-2.5-flash"
+DEFAULT_AUDIO_JUDGE_MODEL = "openai/gpt-audio"
 
 
 _BINARY_CONFIG = {
@@ -2959,9 +2957,7 @@ def get_evaluators_by_uuids(
             f"WHERE uuid IN ({placeholders}) AND deleted_at IS NULL",
             unique_uuids,
         )
-        return {
-            row["uuid"]: _parse_evaluator_row(row) for row in cursor.fetchall()
-        }
+        return {row["uuid"]: _parse_evaluator_row(row) for row in cursor.fetchall()}
 
 
 def get_evaluator_uuid_for_legacy_metric(metric_uuid: str) -> Optional[str]:
@@ -5308,9 +5304,7 @@ def create_annotation_task(
     if not user_id:
         raise ValueError("user_id is required when creating an annotation task")
     if type not in ANNOTATION_TASK_TYPES:
-        raise ValueError(
-            f"type must be one of {ANNOTATION_TASK_TYPES}, got {type!r}"
-        )
+        raise ValueError(f"type must be one of {ANNOTATION_TASK_TYPES}, got {type!r}")
     with get_db_connection() as conn:
         cursor = conn.cursor()
         task_uuid = str(uuid.uuid4())
@@ -5556,9 +5550,7 @@ def create_annotator(name: str, user_id: str) -> str:
             )
             conn.commit()
         except sqlite3.IntegrityError as e:
-            raise ValueError(
-                f"Annotator with name '{name}' already exists"
-            ) from e
+            raise ValueError(f"Annotator with name '{name}' already exists") from e
         logger.info(f"Created annotator with UUID: {annotator_uuid}")
         return annotator_uuid
 
@@ -5610,9 +5602,7 @@ def get_all_annotators(user_id: str) -> List[Dict[str, Any]]:
         return [dict(r) for r in cursor.fetchall()]
 
 
-def update_annotator(
-    annotator_uuid: str, name: Optional[str] = None
-) -> bool:
+def update_annotator(annotator_uuid: str, name: Optional[str] = None) -> bool:
     if name is None:
         return False
     name = name.strip()
@@ -5631,9 +5621,7 @@ def update_annotator(
             )
             conn.commit()
         except sqlite3.IntegrityError as e:
-            raise ValueError(
-                f"Annotator with name '{name}' already exists"
-            ) from e
+            raise ValueError(f"Annotator with name '{name}' already exists") from e
         return cursor.rowcount > 0
 
 
@@ -5662,9 +5650,7 @@ def _parse_annotation_item_row(row: sqlite3.Row) -> Dict[str, Any]:
     return item
 
 
-def create_annotation_items(
-    task_id: str, items: List[Dict[str, Any]]
-) -> List[str]:
+def create_annotation_items(task_id: str, items: List[Dict[str, Any]]) -> List[str]:
     """Bulk insert annotation items. Each `items[i]` must have a `payload`
     (dict, list, or any JSON-serialisable value). Returns new item UUIDs."""
     if not items:
@@ -5700,9 +5686,7 @@ def get_annotation_item(item_uuid: str) -> Optional[Dict[str, Any]]:
         return _parse_annotation_item_row(row) if row else None
 
 
-def bulk_update_annotation_items(
-    task_id: str, updates: List[Dict[str, Any]]
-) -> int:
+def bulk_update_annotation_items(task_id: str, updates: List[Dict[str, Any]]) -> int:
     """Update `payload` on multiple items in one task. Each `updates[i]` must
     have `uuid` and `payload`. Items not in this task or soft-deleted are
     skipped silently. Returns rows updated."""
@@ -5730,9 +5714,7 @@ def bulk_update_annotation_items(
     return rows_updated
 
 
-def soft_delete_annotation_items(
-    task_id: str, item_uuids: List[str]
-) -> int:
+def soft_delete_annotation_items(task_id: str, item_uuids: List[str]) -> int:
     """Soft-delete items belonging to `task_id`. Items already deleted, or
     belonging to another task, are skipped silently. Returns rows updated."""
     if not item_uuids:
@@ -6122,9 +6104,6 @@ def clear_evaluator_runs_for_job(job_uuid: str) -> int:
         return cursor.rowcount
 
 
-
-
-
 def _parse_evaluator_run_row(row: sqlite3.Row) -> Dict[str, Any]:
     r = dict(row)
     if r.get("value"):
@@ -6307,9 +6286,7 @@ def get_annotations_for_annotator_overlap_slots(
         return [_parse_annotation_row(r) for r in cursor.fetchall()]
 
 
-def snapshot_eval_job_items(
-    job_uuid: str, items: List[Dict[str, Any]]
-) -> None:
+def snapshot_eval_job_items(job_uuid: str, items: List[Dict[str, Any]]) -> None:
     """Write `(item_uuid, payload)` rows into `annotation_eval_job_items`
     for an annotation-eval job. Idempotent: re-snapshotting the same
     `(job_id, item_id)` is a no-op (UNIQUE constraint with INSERT OR
