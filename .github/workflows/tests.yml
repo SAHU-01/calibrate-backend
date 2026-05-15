@@ -6,11 +6,23 @@ on:
     paths-ignore:
       - "*.md"
       - "**/*.md"
+      - "*.yml"
+      - "**/*.yml"
+      - "*.yaml"
+      - "**/*.yaml"
+      - "*.ipynb"
+      - "**/*.ipynb"
   pull_request:
     branches: [main]
     paths-ignore:
       - "*.md"
       - "**/*.md"
+      - "*.yml"
+      - "**/*.yml"
+      - "*.yaml"
+      - "**/*.yaml"
+      - "*.ipynb"
+      - "**/*.ipynb"
   workflow_call:
 
 permissions:
