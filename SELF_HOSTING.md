@@ -17,14 +17,6 @@ End-to-end walkthrough on AWS (EC2 + S3). Substitute `<region>` with your AWS re
 
 > The existing AWS production deploy is fully automated by [.github/workflows/deploy.yml](.github/workflows/deploy.yml). For a brand-new tenant on AWS, you provision the infra once (steps 1–7 below), then add a GitHub Actions environment with your secrets and trigger that workflow for subsequent deploys. The first-time provisioning is the part this section walks through.
 
-## 0. Set CLI defaults
-
-```bash
-aws configure              # if not already set up
-export AWS_REGION=<region>
-export AWS_DEFAULT_REGION=<region>
-```
-
 ## 1. Create the S3 bucket
 
 An S3 bucket is used to store the results of all your evals and media files. Create one and name it `calibrate-backend-artifacts`. Ensure to block all public access for the S3 bucket as the app uses presigned URLs for client access.
