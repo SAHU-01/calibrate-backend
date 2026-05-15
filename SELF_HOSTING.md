@@ -6,10 +6,8 @@ Pick your target cloud (AWS/GCP) and follow that section. Before you start, make
 
 ## Contents
 
-1. [Architecture decisions](#architecture-decisions)
-2. [Per-tenant isolation checklist](#per-tenant-isolation-checklist)
-3. [Deploy on AWS](#deploy-on-aws)
-4. [Deploy on GCP](#deploy-on-gcp)
+1. [Deploy on AWS](#deploy-on-aws)
+2. [Deploy on GCP](#deploy-on-gcp)
 
 # Deploy on AWS
 
@@ -165,6 +163,8 @@ openssl rand -base64 32
 ```
 
 Update the default values given above as needed. For example, You might want to set the `SUPERADMIN_EMAIL` to an email address you own. Set the API keys for different providers (e.g. OpenRouter, OpenAI, etc.). Set the `GOOGLE_CLIENT_ID` to the same value as the one used for self-hosting the frontend.
+
+Refer to [ENV.md](./ENV.md) for the full list of environment variables and their description.
 
 ## 10. Start the app
 
