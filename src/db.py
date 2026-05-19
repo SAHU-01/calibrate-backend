@@ -9,7 +9,7 @@ from typing import Optional, List, Dict, Any, TYPE_CHECKING
 from contextlib import contextmanager
 
 if TYPE_CHECKING:
-    from routers.user_limits import UserLimits
+    from routers.org_limits import OrgLimits
 
 logger = logging.getLogger(__name__)
 
@@ -40,16 +40,49 @@ def get_db_connection():
 # layers are belt-and-braces: API check for the message, DB index for
 # correctness under races / direct writes / forgotten future endpoints.
 _UNIQUE_NAME_TABLES: Dict[str, str] = {
-    "tests": "user_id",
+    "tests": "org_uuid",
+    "agents": "org_uuid",
+    "tools": "org_uuid",
+    "personas": "org_uuid",
+    "scenarios": "org_uuid",
+    "simulations": "org_uuid",
+    "annotation_tasks": "org_uuid",
+    "annotators": "org_uuid",
+    "evaluators": "org_uuid",
+}
+
+
+# Tables that are scoped to an org. The bool indicates whether the column on
+# the table is `org_uuid` (True; the standard convention) — there are no
+# exceptions today but the structure leaves room. Used by the org_uuid
+# ADD-COLUMN migration and the personal-org backfill in `init_db`.
+_ORG_SCOPED_TABLES: Dict[str, str] = {
     "agents": "user_id",
     "tools": "user_id",
+    "tests": "user_id",
     "personas": "user_id",
     "scenarios": "user_id",
+    "metrics": "user_id",
     "simulations": "user_id",
+    "datasets": "user_id",
     "annotation_tasks": "user_id",
     "annotators": "user_id",
+    "jobs": "user_id",
+    "user_limits": "user_id",
     "evaluators": "owner_user_id",
 }
+
+
+def normalize_email(email: Optional[str]) -> str:
+    """Canonical user-email form: stripped + lowercased.
+
+    Every read and write of `users.email` MUST go through this so the column
+    is case-insensitive in effect even though SQLite's default collation isn't.
+    Without it, an invite for `user@example.com` doesn't match a row stored as
+    `User@Example.com`, and a login lookup that lowercases its input doesn't
+    find the mixed-case row at all.
+    """
+    return (email or "").strip().lower()
 
 
 class NameAlreadyExistsError(Exception):
@@ -74,7 +107,7 @@ class NameAlreadyExistsError(Exception):
 def ensure_name_unique(
     table: str,
     name: Optional[str],
-    user_id: Optional[str],
+    org_uuid: Optional[str],
     *,
     entity: str,
     exclude_uuid: Optional[str] = None,
@@ -101,12 +134,11 @@ def ensure_name_unique(
     (`"<entity> name already exists"`). Use the singular display name —
     `"Test"`, `"Agent"`, `"Annotation task"`, etc.
 
-    Replaces the older two-step pattern of an inline `is_name_taken`
-    check followed by a separate `name_uniqueness_guard` block, which
-    was duplicated across ~16 endpoints with subtle wording drift.
+    `org_uuid` is the access-scope key the uniqueness check runs in. Pass
+    `None` only for the evaluator seeded-default namespace (no org).
     """
     if name is not None and is_name_taken(
-        table, name, user_id, exclude_uuid=exclude_uuid
+        table, name, org_uuid, exclude_uuid=exclude_uuid
     ):
         raise NameAlreadyExistsError(entity)
     with name_uniqueness_guard(entity):
@@ -146,15 +178,15 @@ def name_uniqueness_guard(entity_label: str):
 def is_name_taken(
     table: str,
     name: str,
-    user_id: Optional[str],
+    org_uuid: Optional[str],
     exclude_uuid: Optional[str] = None,
 ) -> bool:
     """True if a non-soft-deleted row in `table` already has this `name`
-    for this user. Pass `exclude_uuid` on update paths so the row being
+    in this org. Pass `exclude_uuid` on update paths so the row being
     edited doesn't conflict with itself.
 
-    For `evaluators`, `user_id=None` checks the seeded-default namespace
-    (matches the `COALESCE(owner_user_id, '__seed__')` shape used by the
+    For `evaluators`, `org_uuid=None` checks the seeded-default namespace
+    (matches the `COALESCE(org_uuid, '__seed__')` shape used by the
     DB index).
 
     Whitelisted to the tables that have the matching DB-level partial
@@ -165,27 +197,27 @@ def is_name_taken(
         raise ValueError(
             f"is_name_taken: '{table}' is not in the unique-name whitelist"
         )
-    user_col = _UNIQUE_NAME_TABLES[table]
+    scope_col = _UNIQUE_NAME_TABLES[table]
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        if user_id is None:
+        if org_uuid is None:
             # Seeded-default lane on evaluators (or anywhere else that
             # admits NULL ownership). Plain `IS NULL` matches the index's
             # `COALESCE(..., '__seed__')` because both collapse the entire
             # NULL set into one bucket for uniqueness purposes.
             sql = (
                 f"SELECT 1 FROM {table} "
-                f"WHERE {user_col} IS NULL AND name = ? "
+                f"WHERE {scope_col} IS NULL AND name = ? "
                 f"AND deleted_at IS NULL"
             )
             params: tuple = (name,)
         else:
             sql = (
                 f"SELECT 1 FROM {table} "
-                f"WHERE {user_col} = ? AND name = ? "
+                f"WHERE {scope_col} = ? AND name = ? "
                 f"AND deleted_at IS NULL"
             )
-            params = (user_id, name)
+            params = (org_uuid, name)
         if exclude_uuid:
             sql += " AND uuid != ?"
             params = (*params, exclude_uuid)
@@ -214,6 +246,55 @@ def init_db():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """
+        )
+
+        # ============ Organizations (multi-tenant workspaces) ============
+        # An org is the unit that owns entities (agents, tests, datasets, etc.).
+        # Every user gets a personal org on signup (is_personal=1, name derived
+        # from their email). Users can create additional orgs and invite others
+        # via `organization_members`. Roles are 'owner' (the creator, immutable
+        # — can't be removed via the members API) and 'admin' (everyone else
+        # added; full access to all org entities). There is no read-only role.
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS organizations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uuid TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                created_by_user_id TEXT NOT NULL,
+                is_personal INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                deleted_at TIMESTAMP DEFAULT NULL,
+                FOREIGN KEY (created_by_user_id) REFERENCES users(uuid)
+            )
+        """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS organization_members (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                org_uuid TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('owner','admin')),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                deleted_at TIMESTAMP DEFAULT NULL,
+                FOREIGN KEY (org_uuid) REFERENCES organizations(uuid),
+                FOREIGN KEY (user_id) REFERENCES users(uuid)
+            )
+        """
+        )
+        # One live membership per (org, user). Soft-deleted rows are exempt so
+        # a removed-then-re-added member can rejoin cleanly.
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_org_members_active "
+            "ON organization_members(org_uuid, user_id) WHERE deleted_at IS NULL"
+        )
+        # At most one owner per org (also active-only).
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_org_members_owner_unique "
+            "ON organization_members(org_uuid) WHERE deleted_at IS NULL AND role = 'owner'"
         )
 
         cursor.execute(
@@ -973,54 +1054,44 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
-        # Per-user unique-name partial indexes. The existing `annotators`
-        # index (`idx_annotators_user_name_active`) sets the pattern: one
-        # user can't have two live (non-soft-deleted) rows with the same
-        # name. Soft-deleted rows are exempt — required so a user can
-        # re-create something they previously deleted.
-        #
-        # Belt-and-braces with the API-layer 409 checks: catches TOCTOU
-        # races between two concurrent creates, direct DB inserts (seed
-        # scripts, manual repairs), and any future endpoint that forgets
-        # the check. The DB constraint is the source of truth.
-        for stmt in (
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tests_user_name_active "
-            "ON tests(user_id, name) WHERE deleted_at IS NULL",
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_user_name_active "
-            "ON agents(user_id, name) WHERE deleted_at IS NULL",
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tools_user_name_active "
-            "ON tools(user_id, name) WHERE deleted_at IS NULL",
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_personas_user_name_active "
-            "ON personas(user_id, name) WHERE deleted_at IS NULL",
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_scenarios_user_name_active "
-            "ON scenarios(user_id, name) WHERE deleted_at IS NULL",
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_simulations_user_name_active "
-            "ON simulations(user_id, name) WHERE deleted_at IS NULL",
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_annotation_tasks_user_name_active "
-            "ON annotation_tasks(user_id, name) WHERE deleted_at IS NULL",
-            # Evaluators have a dual ownership model: per-user (owner_user_id
-            # set) and seeded defaults (owner_user_id IS NULL, visible to
-            # everyone). SQLite treats multiple NULLs as distinct in unique
-            # indexes, so a plain (owner_user_id, name) index would let two
-            # seeded defaults share a name. COALESCE collapses NULL into a
-            # single virtual namespace so seeded defaults compete among
-            # themselves.
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_evaluators_owner_name_active "
-            "ON evaluators(COALESCE(owner_user_id, '__seed__'), name) "
-            "WHERE deleted_at IS NULL",
-        ):
-            try:
-                cursor.execute(stmt)
-            except sqlite3.OperationalError:
-                # Either the index already exists (re-run init) or existing
-                # data violates uniqueness. Latter case shouldn't occur per
-                # owner's confirmation; keep the guard for re-init safety.
-                pass
+        # Per-org unique-name partial indexes are created BELOW, after the
+        # `ALTER TABLE ... ADD COLUMN org_uuid` migration runs. Creating them
+        # here would silently fail on a fresh / pre-multitenant DB because
+        # the `org_uuid` column doesn't exist yet (and the `OperationalError`
+        # handler would swallow the failure, leaving the DB without
+        # uniqueness protection until init_db ran a second time).
 
         conn.commit()
 
+        # One-time normalization: lowercase any existing user emails so the
+        # case-insensitive contract of `normalize_email` holds for rows that
+        # were inserted before the helper existed. Idempotent. The UNIQUE
+        # constraint on `users.email` would block this if two pre-existing
+        # rows differ only in case — surface that loudly rather than silently
+        # half-migrate.
+        try:
+            cursor.execute(
+                "UPDATE users SET email = LOWER(email) WHERE email != LOWER(email)"
+            )
+            if cursor.rowcount > 0:
+                logger.info(
+                    f"Lowercased {cursor.rowcount} user email(s) for case-insensitive lookup"
+                )
+        except sqlite3.IntegrityError:
+            logger.error(
+                "Email lowercasing hit a UNIQUE conflict — two users likely "
+                "share an email differing only in case. Manual deduplication "
+                "required before this migration can complete."
+            )
+            raise
+        conn.commit()
+
         # Create default user if not exists and update existing rows with NULL user_id
-        cursor.execute("SELECT uuid FROM users WHERE email = ?", (DEFAULT_USER_EMAIL,))
+        default_user_email_normalized = normalize_email(DEFAULT_USER_EMAIL)
+        cursor.execute(
+            "SELECT uuid FROM users WHERE email = ?",
+            (default_user_email_normalized,),
+        )
         default_user_row = cursor.fetchone()
 
         if default_user_row:
@@ -1038,7 +1109,7 @@ def init_db():
                     default_user_uuid,
                     DEFAULT_USER_FIRST_NAME,
                     DEFAULT_USER_LAST_NAME,
-                    DEFAULT_USER_EMAIL,
+                    default_user_email_normalized,
                 ),
             )
             conn.commit()
@@ -1058,9 +1129,207 @@ def init_db():
 
         conn.commit()
 
+        # ============ Multi-tenant: org_uuid columns + personal-org backfill ============
+        # Phase 1: every user gets a personal org (is_personal=1) with role=owner.
+        # Phase 2: every scoped entity row gets `org_uuid` set to its owner's
+        # personal org. Both phases are idempotent — re-running init_db on an
+        # already-migrated DB is a no-op.
+        #
+        # `user_id`/`owner_user_id` columns are LEFT IN PLACE during this
+        # release: routers continue to use them as the access key; the new
+        # `org_uuid` column rides alongside as a future-proof tag. A later PR
+        # flips the access checks over and reclassifies `user_id` as the
+        # "created_by" label. Keeping the old column means the cutover is
+        # rollback-safe.
+        for table in _ORG_SCOPED_TABLES:
+            try:
+                cursor.execute(
+                    f"ALTER TABLE {table} ADD COLUMN org_uuid TEXT DEFAULT NULL"
+                )
+            except sqlite3.OperationalError:
+                pass
+
+        # Phase 1: create a personal org for every user that doesn't have one,
+        # add owner membership.
+        cursor.execute(
+            """
+            SELECT u.uuid, u.email, u.first_name
+              FROM users u
+             WHERE NOT EXISTS (
+                    SELECT 1 FROM organizations o
+                     WHERE o.created_by_user_id = u.uuid
+                       AND o.is_personal = 1
+                       AND o.deleted_at IS NULL
+                )
+            """
+        )
+        users_needing_personal_org = cursor.fetchall()
+        for row in users_needing_personal_org:
+            user_uuid = row["uuid"]
+            personal_org_uuid = str(uuid.uuid4())
+            personal_org_name = _default_personal_org_name(
+                row["email"], row["first_name"]
+            )
+            cursor.execute(
+                """
+                INSERT INTO organizations
+                    (uuid, name, created_by_user_id, is_personal)
+                VALUES (?, ?, ?, 1)
+                """,
+                (personal_org_uuid, personal_org_name, user_uuid),
+            )
+            cursor.execute(
+                """
+                INSERT INTO organization_members (org_uuid, user_id, role)
+                VALUES (?, ?, 'owner')
+                """,
+                (personal_org_uuid, user_uuid),
+            )
+        if users_needing_personal_org:
+            logger.info(
+                f"Created personal orgs for {len(users_needing_personal_org)} user(s)"
+            )
+
+        # Phase 2: backfill org_uuid on every scoped entity row that doesn't
+        # have one, using the owner's personal org.
+        for table, owner_col in _ORG_SCOPED_TABLES.items():
+            cursor.execute(
+                f"""
+                UPDATE {table}
+                   SET org_uuid = (
+                       SELECT o.uuid FROM organizations o
+                        WHERE o.created_by_user_id = {table}.{owner_col}
+                          AND o.is_personal = 1
+                          AND o.deleted_at IS NULL
+                        LIMIT 1
+                   )
+                 WHERE org_uuid IS NULL
+                   AND {owner_col} IS NOT NULL
+                """
+            )
+            if cursor.rowcount > 0:
+                logger.info(
+                    f"Backfilled org_uuid on {cursor.rowcount} row(s) in {table}"
+                )
+
+        # Per-org unique-name partial indexes. One org can't have two live
+        # (non-soft-deleted) rows with the same name. Soft-deleted rows are
+        # exempt — required so the same name can be re-used after delete.
+        #
+        # These run AFTER the `ALTER TABLE ... ADD COLUMN org_uuid` migration
+        # above and AFTER the personal-org backfill, so on a fresh DB the
+        # `org_uuid` column exists by the time we reference it AND every row
+        # has the column populated (no spurious uniqueness collisions).
+        #
+        # The pre-multi-tenant indexes (idx_*_user_name_active, scoped by
+        # user_id) are dropped first so they don't keep enforcing the old
+        # per-user scope after the access boundary flips to per-org.
+        #
+        # Belt-and-braces with the API-layer 409 checks: catches TOCTOU
+        # races between two concurrent creates, direct DB inserts (seed
+        # scripts, manual repairs), and any future endpoint that forgets
+        # the check. The DB constraint is the source of truth.
+        for old_idx in (
+            "idx_tests_user_name_active",
+            "idx_agents_user_name_active",
+            "idx_tools_user_name_active",
+            "idx_personas_user_name_active",
+            "idx_scenarios_user_name_active",
+            "idx_simulations_user_name_active",
+            "idx_annotation_tasks_user_name_active",
+            "idx_annotators_user_name_active",
+            "idx_evaluators_owner_name_active",
+        ):
+            try:
+                cursor.execute(f"DROP INDEX IF EXISTS {old_idx}")
+            except sqlite3.OperationalError:
+                pass
+
+        for stmt in (
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tests_org_name_active "
+            "ON tests(org_uuid, name) WHERE deleted_at IS NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_org_name_active "
+            "ON agents(org_uuid, name) WHERE deleted_at IS NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tools_org_name_active "
+            "ON tools(org_uuid, name) WHERE deleted_at IS NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_personas_org_name_active "
+            "ON personas(org_uuid, name) WHERE deleted_at IS NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_scenarios_org_name_active "
+            "ON scenarios(org_uuid, name) WHERE deleted_at IS NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_simulations_org_name_active "
+            "ON simulations(org_uuid, name) WHERE deleted_at IS NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_annotation_tasks_org_name_active "
+            "ON annotation_tasks(org_uuid, name) WHERE deleted_at IS NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_annotators_org_name_active "
+            "ON annotators(org_uuid, name) WHERE deleted_at IS NULL",
+            # Evaluators have a dual ownership model: per-org (org_uuid set)
+            # and seeded defaults (org_uuid IS NULL, visible to everyone).
+            # SQLite treats multiple NULLs as distinct in unique indexes, so a
+            # plain (org_uuid, name) index would let two seeded defaults
+            # share a name. COALESCE collapses NULL into a single virtual
+            # namespace so seeded defaults compete among themselves.
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_evaluators_org_name_active "
+            "ON evaluators(COALESCE(org_uuid, '__seed__'), name) "
+            "WHERE deleted_at IS NULL",
+        ):
+            try:
+                cursor.execute(stmt)
+            except sqlite3.OperationalError:
+                # Either the index already exists (re-run init) or existing
+                # data violates uniqueness. Latter case shouldn't occur per
+                # owner's confirmation; keep the guard for re-init safety.
+                pass
+
+        conn.commit()
+
+        # ============ org_limits (renamed from user_limits) ============
+        # Same shape as `user_limits` but scoped by `org_uuid` instead of
+        # `user_id`. The old table is kept around for rollback safety; new code
+        # reads/writes here.
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS org_limits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uuid TEXT NOT NULL UNIQUE,
+                org_uuid TEXT NOT NULL UNIQUE,
+                limits TEXT NOT NULL DEFAULT '{}',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (org_uuid) REFERENCES organizations(uuid)
+            )
+            """
+        )
+
+        # Backfill org_limits from any existing user_limits rows by mapping
+        # the user_id to the user's personal org. Idempotent thanks to the
+        # NOT EXISTS subquery.
+        cursor.execute(
+            """
+            INSERT INTO org_limits (uuid, org_uuid, limits, created_at, updated_at)
+            SELECT ul.uuid,
+                   o.uuid AS org_uuid,
+                   ul.limits,
+                   ul.created_at,
+                   ul.updated_at
+              FROM user_limits ul
+              JOIN organizations o
+                ON o.created_by_user_id = ul.user_id
+               AND o.is_personal = 1
+               AND o.deleted_at IS NULL
+             WHERE NOT EXISTS (
+                   SELECT 1 FROM org_limits ol WHERE ol.org_uuid = o.uuid
+             )
+            """
+        )
+        if cursor.rowcount > 0:
+            logger.info(
+                f"Backfilled org_limits from user_limits ({cursor.rowcount} row(s))"
+            )
+
+        conn.commit()
+
         # ============ Evaluator migrations + seed ============
         _seed_default_evaluators(cursor, conn)
-        _migrate_metrics_to_evaluators(cursor, conn)
         _backfill_test_evaluator_links(cursor, conn)
 
         conn.commit()
@@ -1883,117 +2152,6 @@ def _insert_seed_live_version(
     )
 
 
-def _migrate_metrics_to_evaluators(
-    cursor: sqlite3.Cursor, conn: sqlite3.Connection
-) -> None:
-    """One-time migration: copy rows from legacy `metrics` table to `evaluators` and rewrite the
-    `simulation_metrics` pivot as `simulation_evaluators`. Idempotent via `source_metric_uuid`.
-    """
-
-    def _legacy_metric_criteria(row: sqlite3.Row) -> str:
-        return (row["description"]).strip()
-
-    def _simulation_prompt_for_metric(row: sqlite3.Row) -> str:
-        return DEFAULT_PROMPTS_BY_PURPOSE["simulation"]["system_prompt"].replace(
-            "<ENTER EVALUATION CRITERIA HERE>",
-            _legacy_metric_criteria(row),
-        )
-
-    try:
-        cursor.execute(
-            "SELECT uuid, name, description, config, user_id, created_at, updated_at, deleted_at "
-            "FROM metrics"
-        )
-    except sqlite3.OperationalError:
-        return
-    legacy_rows = cursor.fetchall()
-    if not legacy_rows:
-        return
-
-    cursor.execute(
-        "SELECT source_metric_uuid FROM evaluators WHERE source_metric_uuid IS NOT NULL"
-    )
-    migrated = {row["source_metric_uuid"] for row in cursor.fetchall()}
-
-    migrated_count = 0
-    for row in legacy_rows:
-        legacy_uuid = row["uuid"]
-        if legacy_uuid in migrated:
-            continue
-
-        cursor.execute(
-            "SELECT 1 FROM simulation_metrics WHERE metric_id = ? AND deleted_at IS NULL LIMIT 1",
-            (legacy_uuid,),
-        )
-        is_simulation_metric = cursor.fetchone() is not None
-        evaluator_type = "simulation" if is_simulation_metric else "llm"
-        system_prompt = (
-            _simulation_prompt_for_metric(row)
-            if is_simulation_metric
-            else _legacy_metric_criteria(row)
-        )
-
-        evaluator_uuid = str(uuid.uuid4())
-        cursor.execute(
-            """
-            INSERT INTO evaluators
-                (uuid, name, description, owner_user_id,
-                 evaluator_type, data_type, kind,
-                 output_type, source_metric_uuid,
-                 created_at, updated_at, deleted_at)
-            VALUES (?, ?, ?, ?, ?, 'text', 'single', 'binary', ?, ?, ?, ?)
-            """,
-            (
-                evaluator_uuid,
-                row["name"],
-                row["description"],
-                row["user_id"],
-                evaluator_type,
-                legacy_uuid,
-                row["created_at"],
-                row["updated_at"],
-                row["deleted_at"],
-            ),
-        )
-
-        version_uuid = str(uuid.uuid4())
-        cursor.execute(
-            """
-            INSERT INTO evaluator_versions
-                (uuid, evaluator_id, version_number, judge_model, system_prompt,
-                 output_config, variables)
-            VALUES (?, ?, 1, ?, ?, ?, NULL)
-            """,
-            (
-                version_uuid,
-                evaluator_uuid,
-                DEFAULT_TEXT_JUDGE_MODEL,
-                system_prompt,
-                json.dumps(_BINARY_CONFIG),
-            ),
-        )
-        cursor.execute(
-            "UPDATE evaluators SET live_version_id = ? WHERE uuid = ?",
-            (version_uuid, evaluator_uuid),
-        )
-
-        cursor.execute(
-            """
-            INSERT OR IGNORE INTO simulation_evaluators
-                (simulation_id, evaluator_id, evaluator_version_id, variable_values, created_at, deleted_at)
-            SELECT simulation_id, ?, ?, NULL, created_at, deleted_at
-              FROM simulation_metrics
-             WHERE metric_id = ?
-            """,
-            (evaluator_uuid, version_uuid, legacy_uuid),
-        )
-        migrated_count += 1
-
-    conn.commit()
-    if migrated_count:
-        logger.info(f"Migrated {migrated_count} metric(s) to evaluators")
-
-
 def _backfill_test_evaluator_links(
     cursor: sqlite3.Cursor, conn: sqlite3.Connection
 ) -> None:
@@ -2060,12 +2218,79 @@ def _backfill_test_evaluator_links(
 # ============ Users Functions ============
 
 
+def _default_personal_org_name(email: Optional[str], first_name: Optional[str]) -> str:
+    """Name used for the personal org auto-created on signup / backfilled in init_db.
+
+    Prefers the email local-part (everything before '@') so the user recognises
+    it; falls back to `<first_name>'s workspace` and finally a generic label.
+    """
+    if email and "@" in email:
+        return f"{email.split('@', 1)[0]}'s workspace"
+    if first_name:
+        return f"{first_name}'s workspace"
+    return "Personal workspace"
+
+
+def _create_personal_org_for_user(
+    cursor: sqlite3.Cursor,
+    user_uuid: str,
+    email: Optional[str],
+    first_name: Optional[str],
+) -> str:
+    """Create a personal org + owner membership for the given user.
+
+    Called on signup (Google + email/password) AND from init_db backfill — so
+    it operates on a caller-supplied cursor and does NOT commit. Caller is
+    responsible for the transaction boundary.
+    """
+    org_uuid = str(uuid.uuid4())
+    cursor.execute(
+        """
+        INSERT INTO organizations
+            (uuid, name, created_by_user_id, is_personal)
+        VALUES (?, ?, ?, 1)
+        """,
+        (org_uuid, _default_personal_org_name(email, first_name), user_uuid),
+    )
+    cursor.execute(
+        """
+        INSERT INTO organization_members (org_uuid, user_id, role)
+        VALUES (?, ?, 'owner')
+        """,
+        (org_uuid, user_uuid),
+    )
+    return org_uuid
+
+
+def get_personal_org_for_user(user_id: str) -> Optional[Dict[str, Any]]:
+    """Return the user's personal (auto-provisioned) org, or None.
+
+    This is the implicit default workspace when the client doesn't send an
+    explicit org override (e.g. via an `X-Org-UUID` header).
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT * FROM organizations
+             WHERE created_by_user_id = ?
+               AND is_personal = 1
+               AND deleted_at IS NULL
+             LIMIT 1
+            """,
+            (user_id,),
+        )
+        row = cursor.fetchone()
+        return _parse_org_row(row) if row else None
+
+
 def create_user(
     first_name: str,
     last_name: str,
     email: str,
 ) -> str:
-    """Create a new user and return its UUID."""
+    """Create a new user (with auto-provisioned personal org) and return its UUID."""
+    email = normalize_email(email)
     with get_db_connection() as conn:
         cursor = conn.cursor()
         user_uuid = str(uuid.uuid4())
@@ -2076,6 +2301,7 @@ def create_user(
             """,
             (user_uuid, first_name, last_name, email),
         )
+        _create_personal_org_for_user(cursor, user_uuid, email, first_name)
         conn.commit()
         logger.info(f"Created user with UUID: {user_uuid}")
         return user_uuid
@@ -2093,7 +2319,9 @@ def get_user(user_uuid: str) -> Optional[Dict[str, Any]]:
 
 
 def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
-    """Get a user by email."""
+    """Get a user by email. Matches the lowercase-normalized form so callers
+    can pass user-provided strings of any casing."""
+    email = normalize_email(email)
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM users WHERE email = ?", (email,))
@@ -2130,7 +2358,7 @@ def update_user(
         params.append(last_name)
     if email is not None:
         updates.append("email = ?")
-        params.append(email)
+        params.append(normalize_email(email))
 
     if not updates:
         return False
@@ -2167,7 +2395,15 @@ def get_or_create_user(
     first_name: str,
     last_name: str,
 ) -> Dict[str, Any]:
-    """Get a user by email, or create a new one if not found."""
+    """Get a user by email, or create a new one if not found.
+
+    Email is lowercased so Google OAuth signups match any pre-existing
+    stub-user invites stored by `add_organization_member` (which also
+    lowercases). Otherwise a `User@Example.com` Google signup would miss the
+    `user@example.com` stub and the invitee would land in a new account with
+    no pre-added memberships.
+    """
+    email = normalize_email(email)
     user = get_user_by_email(email)
     if user:
         # Update name if changed
@@ -2187,20 +2423,298 @@ def create_user_with_password(
     email: str,
     password_hash: str,
 ) -> str:
-    """Create a new user with email/password and return its UUID."""
+    """Create a new user with email/password (+ personal org) and return its UUID.
+
+    If a stub user (created by an org invite before signup — no
+    `password_hash`, no name) already exists for this email, we hydrate that
+    row instead of inserting a new one. This is what lets an invited person
+    sign up later and immediately see any orgs they were pre-added to. We
+    refuse to overwrite an existing password_hash to avoid an account-takeover
+    vector via /signup with someone else's email.
+
+    Email is normalized to lowercase before lookup/insert so it matches the
+    same normalization done by `add_organization_member` — otherwise an
+    invitee who signs up with different casing would miss their stub row.
+    """
+    email = normalize_email(email)
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        user_uuid = str(uuid.uuid4())
+        cursor.execute(
+            "SELECT uuid, password_hash FROM users WHERE email = ?", (email,)
+        )
+        existing = cursor.fetchone()
+        if existing is not None:
+            if existing["password_hash"] is not None:
+                raise ValueError("email already registered")
+            # Hydrate the stub user row in place; preserve its uuid so any
+            # existing organization_members rows keep working.
+            user_uuid = existing["uuid"]
+            cursor.execute(
+                """
+                UPDATE users
+                   SET first_name = ?, last_name = ?, password_hash = ?,
+                       updated_at = CURRENT_TIMESTAMP
+                 WHERE uuid = ?
+                """,
+                (first_name, last_name, password_hash, user_uuid),
+            )
+        else:
+            user_uuid = str(uuid.uuid4())
+            cursor.execute(
+                """
+                INSERT INTO users (uuid, first_name, last_name, email, password_hash)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (user_uuid, first_name, last_name, email, password_hash),
+            )
+
+        # Ensure personal org exists (idempotent — skip if already present).
         cursor.execute(
             """
-            INSERT INTO users (uuid, first_name, last_name, email, password_hash)
-            VALUES (?, ?, ?, ?, ?)
+            SELECT 1 FROM organizations
+             WHERE created_by_user_id = ? AND is_personal = 1 AND deleted_at IS NULL
+             LIMIT 1
             """,
-            (user_uuid, first_name, last_name, email, password_hash),
+            (user_uuid,),
         )
+        if cursor.fetchone() is None:
+            _create_personal_org_for_user(cursor, user_uuid, email, first_name)
+
         conn.commit()
         logger.info(f"Created user (email/password auth) with UUID: {user_uuid}")
         return user_uuid
+
+
+# ============ Organizations (multi-tenant) ============
+
+
+def _parse_org_row(row: sqlite3.Row) -> Dict[str, Any]:
+    d = dict(row)
+    d["is_personal"] = bool(d.get("is_personal"))
+    return d
+
+
+def create_organization(name: str, owner_user_id: str) -> str:
+    """Create a non-personal org with the given user as the owner member."""
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("organization name required")
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        org_uuid = str(uuid.uuid4())
+        cursor.execute(
+            """
+            INSERT INTO organizations
+                (uuid, name, created_by_user_id, is_personal)
+            VALUES (?, ?, ?, 0)
+            """,
+            (org_uuid, name, owner_user_id),
+        )
+        cursor.execute(
+            """
+            INSERT INTO organization_members (org_uuid, user_id, role)
+            VALUES (?, ?, 'owner')
+            """,
+            (org_uuid, owner_user_id),
+        )
+        conn.commit()
+        return org_uuid
+
+
+def get_organization(org_uuid: str) -> Optional[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM organizations WHERE uuid = ? AND deleted_at IS NULL",
+            (org_uuid,),
+        )
+        row = cursor.fetchone()
+        return _parse_org_row(row) if row else None
+
+
+def update_organization_name(org_uuid: str, name: str) -> bool:
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("organization name required")
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE organizations
+               SET name = ?, updated_at = CURRENT_TIMESTAMP
+             WHERE uuid = ? AND deleted_at IS NULL
+            """,
+            (name, org_uuid),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def list_organizations_for_user(user_id: str) -> List[Dict[str, Any]]:
+    """List all orgs the user is an active member of, with the user's role."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT o.*, m.role AS member_role
+              FROM organizations o
+              JOIN organization_members m ON m.org_uuid = o.uuid
+             WHERE m.user_id = ?
+               AND m.deleted_at IS NULL
+               AND o.deleted_at IS NULL
+             ORDER BY o.is_personal DESC, o.created_at ASC
+            """,
+            (user_id,),
+        )
+        return [_parse_org_row(r) for r in cursor.fetchall()]
+
+
+def get_member_role(org_uuid: str, user_id: str) -> Optional[str]:
+    """Return the user's role in the org, or None if they aren't an active member."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT role FROM organization_members
+             WHERE org_uuid = ? AND user_id = ? AND deleted_at IS NULL
+            """,
+            (org_uuid, user_id),
+        )
+        row = cursor.fetchone()
+        return row["role"] if row else None
+
+
+def list_organization_members(org_uuid: str) -> List[Dict[str, Any]]:
+    """Return active members of an org joined with user info."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT m.user_id, m.role, m.created_at,
+                   u.email, u.first_name, u.last_name
+              FROM organization_members m
+              JOIN users u ON u.uuid = m.user_id
+             WHERE m.org_uuid = ? AND m.deleted_at IS NULL
+             ORDER BY m.created_at ASC
+            """,
+            (org_uuid,),
+        )
+        return [dict(r) for r in cursor.fetchall()]
+
+
+def add_organization_member(
+    org_uuid: str, email: str, role: str = "admin"
+) -> Dict[str, Any]:
+    """Add a member by email. If no user exists for the email, create a stub
+    user row (no password_hash, no name) so the membership can be recorded;
+    when that person eventually signs up via Google or email/password the
+    existing row is hydrated and they immediately see this org.
+
+    Returns the member row info. Raises ValueError if the user is already an
+    active member of this org, or if `org_uuid` doesn't reference an existing
+    non-deleted organization (SQLite doesn't enforce FKs by default, so we
+    validate the parent row at the helper layer rather than relying on the
+    router check — keeps the guard intact for any future caller).
+    """
+    if role not in ("owner", "admin"):
+        raise ValueError("invalid role")
+    if get_organization(org_uuid) is None:
+        raise ValueError("organization not found")
+    email = normalize_email(email)
+    if not email or "@" not in email:
+        raise ValueError("valid email required")
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT uuid FROM users WHERE email = ?", (email,))
+        row = cursor.fetchone()
+        if row is not None:
+            user_uuid = row["uuid"]
+        else:
+            # Create a stub user. No first/last name, no password_hash — those
+            # are filled in when the invitee signs up. The stub user gets its
+            # own personal org too (so when they sign up, the standard
+            # "user has at least one workspace" invariant already holds).
+            user_uuid = str(uuid.uuid4())
+            cursor.execute(
+                """
+                INSERT INTO users (uuid, first_name, last_name, email)
+                VALUES (?, '', '', ?)
+                """,
+                (user_uuid, email),
+            )
+            _create_personal_org_for_user(cursor, user_uuid, email, None)
+
+        # Check for existing active membership.
+        cursor.execute(
+            """
+            SELECT id FROM organization_members
+             WHERE org_uuid = ? AND user_id = ? AND deleted_at IS NULL
+            """,
+            (org_uuid, user_uuid),
+        )
+        if cursor.fetchone() is not None:
+            raise ValueError("user is already a member of this organization")
+
+        # Reactivate a soft-deleted membership if present, else insert fresh.
+        cursor.execute(
+            """
+            SELECT id FROM organization_members
+             WHERE org_uuid = ? AND user_id = ? AND deleted_at IS NOT NULL
+             ORDER BY id DESC LIMIT 1
+            """,
+            (org_uuid, user_uuid),
+        )
+        prev = cursor.fetchone()
+        if prev is not None:
+            cursor.execute(
+                """
+                UPDATE organization_members
+                   SET role = ?, deleted_at = NULL, created_at = CURRENT_TIMESTAMP
+                 WHERE id = ?
+                """,
+                (role, prev["id"]),
+            )
+        else:
+            cursor.execute(
+                """
+                INSERT INTO organization_members (org_uuid, user_id, role)
+                VALUES (?, ?, ?)
+                """,
+                (org_uuid, user_uuid, role),
+            )
+
+        conn.commit()
+        return {"user_id": user_uuid, "email": email, "role": role}
+
+
+def remove_organization_member(org_uuid: str, user_id: str) -> bool:
+    """Soft-delete a member. Raises ValueError if target is the org owner."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT role FROM organization_members
+             WHERE org_uuid = ? AND user_id = ? AND deleted_at IS NULL
+            """,
+            (org_uuid, user_id),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return False
+        if row["role"] == "owner":
+            raise ValueError("cannot remove the organization owner")
+
+        cursor.execute(
+            """
+            UPDATE organization_members
+               SET deleted_at = CURRENT_TIMESTAMP
+             WHERE org_uuid = ? AND user_id = ? AND deleted_at IS NULL
+            """,
+            (org_uuid, user_id),
+        )
+        conn.commit()
+        return True
 
 
 # ============ Agents Functions ============
@@ -2208,33 +2722,35 @@ def create_user_with_password(
 
 def create_agent(
     name: str,
+    org_uuid: str,
     agent_type: str = "agent",
     config: Optional[Dict[str, Any]] = None,
-    user_id: str = None,
+    user_id: Optional[str] = None,
 ) -> str:
     """Create a new agent and return its UUID.
 
     Args:
         name: Name of the agent
+        org_uuid: UUID of the org this agent belongs to (access key — required)
         agent_type: Type of agent — 'agent' or 'connection'
         config: Optional configuration dict
-        user_id: UUID of the user creating this agent (required)
+        user_id: UUID of the user creating this agent (audit / created-by)
 
     Raises:
-        ValueError: If user_id is not provided
+        ValueError: If org_uuid is not provided
     """
-    if not user_id:
-        raise ValueError("user_id is required when creating an agent")
+    if not org_uuid:
+        raise ValueError("org_uuid is required when creating an agent")
     with get_db_connection() as conn:
         cursor = conn.cursor()
         agent_uuid = str(uuid.uuid4())
         config_json = json.dumps(config) if config is not None else None
         cursor.execute(
             """
-            INSERT INTO agents (uuid, name, type, config, user_id)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO agents (uuid, name, type, config, user_id, org_uuid)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (agent_uuid, name, agent_type, config_json, user_id),
+            (agent_uuid, name, agent_type, config_json, user_id, org_uuid),
         )
         conn.commit()
         logger.info(f"Created agent with UUID: {agent_uuid}")
@@ -2264,14 +2780,14 @@ def get_agent(agent_uuid: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def get_all_agents(user_id: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Get all agents, optionally filtered by user_id."""
+def get_all_agents(org_uuid: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Get all agents, optionally filtered by org_uuid."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        if user_id:
+        if org_uuid:
             cursor.execute(
-                "SELECT * FROM agents WHERE deleted_at IS NULL AND user_id = ? ORDER BY created_at DESC",
-                (user_id,),
+                "SELECT * FROM agents WHERE deleted_at IS NULL AND org_uuid = ? ORDER BY created_at DESC",
+                (org_uuid,),
             )
         else:
             cursor.execute(
@@ -2351,34 +2867,34 @@ def delete_agent(agent_uuid: str) -> bool:
 def create_tool(
     name: str,
     description: str,
+    org_uuid: str,
     config: Optional[Dict[str, Any]] = None,
-    user_id: str = None,
+    user_id: Optional[str] = None,
 ) -> str:
     """Create a new tool and return its UUID.
 
     Args:
         name: Name of the tool
         description: Description of the tool
+        org_uuid: UUID of the org this tool belongs to (access key — required)
         config: Optional configuration dict
-        user_id: UUID of the user creating this tool (required)
+        user_id: UUID of the user creating this tool (audit / created-by)
 
     Raises:
-        ValueError: If user_id is not provided
+        ValueError: If org_uuid is not provided
     """
-    if not user_id:
-        raise ValueError("user_id is required when creating a tool")
+    if not org_uuid:
+        raise ValueError("org_uuid is required when creating a tool")
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        # Generate UUID for the tool
         tool_uuid = str(uuid.uuid4())
-        # Serialize config to JSON string for storage
         config_json = json.dumps(config) if config is not None else None
         cursor.execute(
             """
-            INSERT INTO tools (uuid, name, description, config, user_id)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO tools (uuid, name, description, config, user_id, org_uuid)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (tool_uuid, name, description, config_json, user_id),
+            (tool_uuid, name, description, config_json, user_id, org_uuid),
         )
         conn.commit()
         logger.info(f"Created tool with UUID: {tool_uuid}")
@@ -2408,14 +2924,14 @@ def get_tool(tool_uuid: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def get_all_tools(user_id: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Get all tools, optionally filtered by user_id."""
+def get_all_tools(org_uuid: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Get all tools, optionally filtered by org_uuid."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        if user_id:
+        if org_uuid:
             cursor.execute(
-                "SELECT * FROM tools WHERE deleted_at IS NULL AND user_id = ? ORDER BY created_at DESC",
-                (user_id,),
+                "SELECT * FROM tools WHERE deleted_at IS NULL AND org_uuid = ? ORDER BY created_at DESC",
+                (org_uuid,),
             )
         else:
             cursor.execute(
@@ -2592,13 +3108,29 @@ def get_agent_tool_link(agent_id: str, tool_id: str) -> Optional[Dict[str, Any]]
         return None
 
 
-def get_all_agent_tools() -> List[Dict[str, Any]]:
-    """Get all agent-tool links."""
+def get_all_agent_tools(org_uuid: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Get all agent-tool links, optionally scoped to one org via the
+    parent agent. Links are gated through the agent (the access-key entity);
+    the tool's org is verified separately at the router layer when creating."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT * FROM agent_tools WHERE deleted_at IS NULL ORDER BY created_at DESC"
-        )
+        if org_uuid is None:
+            cursor.execute(
+                "SELECT * FROM agent_tools WHERE deleted_at IS NULL "
+                "ORDER BY created_at DESC"
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT at.* FROM agent_tools at
+                  JOIN agents a ON a.uuid = at.agent_id
+                 WHERE at.deleted_at IS NULL
+                   AND a.deleted_at IS NULL
+                   AND a.org_uuid = ?
+                 ORDER BY at.created_at DESC
+                """,
+                (org_uuid,),
+            )
         rows = cursor.fetchall()
         return [dict(row) for row in rows]
 
@@ -2609,32 +3141,34 @@ def get_all_agent_tools() -> List[Dict[str, Any]]:
 def create_test(
     name: str,
     type: str,
+    org_uuid: str,
     config: Optional[Dict[str, Any]] = None,
-    user_id: str = None,
+    user_id: Optional[str] = None,
 ) -> str:
     """Create a new test and return its UUID.
 
     Args:
         name: Name of the test
         type: Type of the test
+        org_uuid: UUID of the org this test belongs to (access key — required)
         config: Optional configuration dict
-        user_id: UUID of the user creating this test (required)
+        user_id: UUID of the user creating this test (audit / created-by)
 
     Raises:
-        ValueError: If user_id is not provided
+        ValueError: If org_uuid is not provided
     """
-    if not user_id:
-        raise ValueError("user_id is required when creating a test")
+    if not org_uuid:
+        raise ValueError("org_uuid is required when creating a test")
     with get_db_connection() as conn:
         cursor = conn.cursor()
         test_uuid = str(uuid.uuid4())
         config_json = json.dumps(config) if config is not None else None
         cursor.execute(
             """
-            INSERT INTO tests (uuid, name, type, config, user_id)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO tests (uuid, name, type, config, user_id, org_uuid)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (test_uuid, name, type, config_json, user_id),
+            (test_uuid, name, type, config_json, user_id, org_uuid),
         )
         conn.commit()
         logger.info(f"Created test with UUID: {test_uuid}")
@@ -2643,16 +3177,17 @@ def create_test(
 
 def bulk_create_tests(
     tests: List[Dict[str, Any]],
-    user_id: str,
+    org_uuid: str,
+    user_id: Optional[str] = None,
 ) -> List[str]:
     """Create multiple tests in a single transaction and return their UUIDs.
 
     Each item in tests must have keys: name, type, config.
-    Raises ValueError if user_id is missing or any name collides with an
-    existing (non-deleted) test owned by the same user.
+    Raises ValueError if org_uuid is missing or any name collides with an
+    existing (non-deleted) test in the same org.
     """
-    if not user_id:
-        raise ValueError("user_id is required when creating tests")
+    if not org_uuid:
+        raise ValueError("org_uuid is required when creating tests")
 
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -2660,8 +3195,8 @@ def bulk_create_tests(
         names = [t["name"] for t in tests]
         placeholders = ",".join("?" for _ in names)
         cursor.execute(
-            f"SELECT name FROM tests WHERE user_id = ? AND deleted_at IS NULL AND name IN ({placeholders})",
-            [user_id] + names,
+            f"SELECT name FROM tests WHERE org_uuid = ? AND deleted_at IS NULL AND name IN ({placeholders})",
+            [org_uuid] + names,
         )
         existing = {row["name"] for row in cursor.fetchall()}
         if existing:
@@ -2675,10 +3210,10 @@ def bulk_create_tests(
             )
             cursor.execute(
                 """
-                INSERT INTO tests (uuid, name, type, config, user_id)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO tests (uuid, name, type, config, user_id, org_uuid)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (test_uuid, t["name"], t["type"], config_json, user_id),
+                (test_uuid, t["name"], t["type"], config_json, user_id, org_uuid),
             )
             uuids.append(test_uuid)
 
@@ -2708,14 +3243,14 @@ def get_test(test_uuid: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def get_all_tests(user_id: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Get all tests, optionally filtered by user_id."""
+def get_all_tests(org_uuid: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Get all tests, optionally filtered by org_uuid."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        if user_id:
+        if org_uuid:
             cursor.execute(
-                "SELECT * FROM tests WHERE deleted_at IS NULL AND user_id = ? ORDER BY created_at DESC",
-                (user_id,),
+                "SELECT * FROM tests WHERE deleted_at IS NULL AND org_uuid = ? ORDER BY created_at DESC",
+                (org_uuid,),
             )
         else:
             cursor.execute(
@@ -2789,18 +3324,18 @@ def delete_test(test_uuid: str) -> bool:
         return deleted
 
 
-def bulk_delete_tests(test_uuids: List[str], user_id: str) -> int:
-    """Soft delete multiple tests owned by user_id.
+def bulk_delete_tests(test_uuids: List[str], org_uuid: str) -> int:
+    """Soft delete multiple tests in `org_uuid`.
     Also soft deletes related agent_tests entries.
     Returns the number of tests actually deleted.
 
-    Security note: the agent_tests cleanup is scoped to UUIDs the caller
-    actually owns — NOT the raw input list. Without this, a caller could
-    pass another user's test UUID alongside one of their own and have
-    every link to that other user's test soft-deleted across all agents
-    (the test row stays alive thanks to the ownership filter, but the
-    links are gone). The fix is to resolve the owned UUIDs first and
-    constrain both updates to that set.
+    Security note: the agent_tests cleanup is scoped to UUIDs the caller's
+    org actually owns — NOT the raw input list. Without this, a caller could
+    pass another org's test UUID alongside one of their own and have every
+    link to that other org's test soft-deleted across all agents (the test
+    row stays alive thanks to the org filter, but the links are gone). The
+    fix is to resolve the owned UUIDs first and constrain both updates to
+    that set.
     """
     if not test_uuids:
         return 0
@@ -2808,15 +3343,15 @@ def bulk_delete_tests(test_uuids: List[str], user_id: str) -> int:
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
-        # Step 1: resolve which of the requested UUIDs the caller actually
-        # owns and which are still alive. Both UPDATEs below are constrained
-        # to this set so unowned UUIDs can never trigger any side effect.
+        # Step 1: resolve which of the requested UUIDs belong to the caller's
+        # org and which are still alive. Both UPDATEs below are constrained
+        # to this set so out-of-org UUIDs can never trigger any side effect.
         in_placeholders = ",".join("?" for _ in test_uuids)
         cursor.execute(
             f"SELECT uuid FROM tests "
             f"WHERE uuid IN ({in_placeholders}) "
-            f"AND user_id = ? AND deleted_at IS NULL",
-            (*test_uuids, user_id),
+            f"AND org_uuid = ? AND deleted_at IS NULL",
+            (*test_uuids, org_uuid),
         )
         owned_uuids = [row["uuid"] for row in cursor.fetchall()]
         if not owned_uuids:
@@ -2824,7 +3359,6 @@ def bulk_delete_tests(test_uuids: List[str], user_id: str) -> int:
 
         owned_placeholders = ",".join("?" for _ in owned_uuids)
 
-        # Step 2: soft-delete only the owned tests.
         cursor.execute(
             f"UPDATE tests SET deleted_at = CURRENT_TIMESTAMP "
             f"WHERE uuid IN ({owned_placeholders}) AND deleted_at IS NULL",
@@ -2832,17 +3366,13 @@ def bulk_delete_tests(test_uuids: List[str], user_id: str) -> int:
         )
         deleted_count = cursor.rowcount
 
-        # Step 3: cascade to agent_tests using the SAME owned-UUID set.
-        # Skipped if step 2 deleted nothing (race: another writer already
-        # got there) — preserves prior behaviour of "no orphan link cleanup
-        # on a no-op delete".
         if deleted_count > 0:
             cursor.execute(
                 f"UPDATE agent_tests SET deleted_at = CURRENT_TIMESTAMP "
                 f"WHERE test_id IN ({owned_placeholders}) AND deleted_at IS NULL",
                 owned_uuids,
             )
-            logger.info(f"Bulk soft deleted {deleted_count} tests for user {user_id}")
+            logger.info(f"Bulk soft deleted {deleted_count} tests for org {org_uuid}")
 
         conn.commit()
         return deleted_count
@@ -2853,33 +3383,35 @@ def bulk_delete_tests(test_uuids: List[str], user_id: str) -> int:
 
 def create_persona(
     name: str,
+    org_uuid: str,
     description: Optional[str] = None,
     config: Optional[Dict[str, Any]] = None,
-    user_id: str = None,
+    user_id: Optional[str] = None,
 ) -> str:
     """Create a new persona and return its UUID.
 
     Args:
         name: Name of the persona
+        org_uuid: UUID of the org this persona belongs to (access key — required)
         description: Optional description
         config: Optional configuration dict
-        user_id: UUID of the user creating this persona (required)
+        user_id: UUID of the user creating this persona (audit / created-by)
 
     Raises:
-        ValueError: If user_id is not provided
+        ValueError: If org_uuid is not provided
     """
-    if not user_id:
-        raise ValueError("user_id is required when creating a persona")
+    if not org_uuid:
+        raise ValueError("org_uuid is required when creating a persona")
     with get_db_connection() as conn:
         cursor = conn.cursor()
         persona_uuid = str(uuid.uuid4())
         config_json = json.dumps(config) if config is not None else None
         cursor.execute(
             """
-            INSERT INTO personas (uuid, name, description, config, user_id)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO personas (uuid, name, description, config, user_id, org_uuid)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (persona_uuid, name, description, config_json, user_id),
+            (persona_uuid, name, description, config_json, user_id, org_uuid),
         )
         conn.commit()
         logger.info(f"Created persona with UUID: {persona_uuid}")
@@ -2908,14 +3440,14 @@ def get_persona(persona_uuid: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def get_all_personas(user_id: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Get all personas, optionally filtered by user_id."""
+def get_all_personas(org_uuid: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Get all personas, optionally filtered by org_uuid."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        if user_id:
+        if org_uuid:
             cursor.execute(
-                "SELECT * FROM personas WHERE deleted_at IS NULL AND user_id = ? ORDER BY created_at DESC",
-                (user_id,),
+                "SELECT * FROM personas WHERE deleted_at IS NULL AND org_uuid = ? ORDER BY created_at DESC",
+                (org_uuid,),
             )
         else:
             cursor.execute(
@@ -2985,30 +3517,32 @@ def delete_persona(persona_uuid: str) -> bool:
 
 def create_scenario(
     name: str,
+    org_uuid: str,
     description: Optional[str] = None,
-    user_id: str = None,
+    user_id: Optional[str] = None,
 ) -> str:
     """Create a new scenario and return its UUID.
 
     Args:
         name: Name of the scenario
+        org_uuid: UUID of the org this scenario belongs to (access key — required)
         description: Optional description
-        user_id: UUID of the user creating this scenario (required)
+        user_id: UUID of the user creating this scenario (audit / created-by)
 
     Raises:
-        ValueError: If user_id is not provided
+        ValueError: If org_uuid is not provided
     """
-    if not user_id:
-        raise ValueError("user_id is required when creating a scenario")
+    if not org_uuid:
+        raise ValueError("org_uuid is required when creating a scenario")
     with get_db_connection() as conn:
         cursor = conn.cursor()
         scenario_uuid = str(uuid.uuid4())
         cursor.execute(
             """
-            INSERT INTO scenarios (uuid, name, description, user_id)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO scenarios (uuid, name, description, user_id, org_uuid)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (scenario_uuid, name, description, user_id),
+            (scenario_uuid, name, description, user_id, org_uuid),
         )
         conn.commit()
         logger.info(f"Created scenario with UUID: {scenario_uuid}")
@@ -3029,14 +3563,14 @@ def get_scenario(scenario_uuid: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def get_all_scenarios(user_id: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Get all scenarios, optionally filtered by user_id."""
+def get_all_scenarios(org_uuid: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Get all scenarios, optionally filtered by org_uuid."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        if user_id:
+        if org_uuid:
             cursor.execute(
-                "SELECT * FROM scenarios WHERE deleted_at IS NULL AND user_id = ? ORDER BY created_at DESC",
-                (user_id,),
+                "SELECT * FROM scenarios WHERE deleted_at IS NULL AND org_uuid = ? ORDER BY created_at DESC",
+                (org_uuid,),
             )
         else:
             cursor.execute(
@@ -3146,9 +3680,13 @@ def create_evaluator(
     kind: str = "single",
     output_type: str = "binary",
     owner_user_id: Optional[str] = None,
+    org_uuid: Optional[str] = None,
     slug: Optional[str] = None,
 ) -> str:
-    """Create a new evaluator (without any versions). owner_user_id=None means a default evaluator.
+    """Create a new evaluator (without any versions).
+
+    `org_uuid=None` AND `owner_user_id=None` means a seeded default evaluator
+    (visible to every org). For user-created evaluators, both should be set.
 
     output_config lives on each version, not here.
     """
@@ -3166,15 +3704,16 @@ def create_evaluator(
         cursor.execute(
             """
             INSERT INTO evaluators
-                (uuid, name, description, owner_user_id,
+                (uuid, name, description, owner_user_id, org_uuid,
                  evaluator_type, data_type, kind, output_type, slug)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 evaluator_uuid,
                 name,
                 description,
                 owner_user_id,
+                org_uuid,
                 evaluator_type,
                 data_type,
                 kind,
@@ -3223,11 +3762,13 @@ def get_evaluators_by_uuids(
 
 
 def get_evaluator_uuid_for_legacy_metric(metric_uuid: str) -> Optional[str]:
-    """If `metric_uuid` is a migrated legacy `metrics.uuid`, return the new evaluator row UUID.
-
-    Migration stores the old metric id in `evaluators.source_metric_uuid` and assigns a fresh
-    evaluator primary key — clients must use the evaluator UUID, not the metric UUID.
-    """
+    """On DBs where the legacy metrics→evaluators migration previously ran,
+    returns the new evaluator's UUID for a given old `metrics.uuid`. New DBs
+    have no migrated rows (the migration was removed in PR #52), so this
+    returns None. Kept for the friendly 400 error surfaced by
+    `simulations.py` when a caller passes a legacy metric UUID instead of an
+    evaluator UUID — clients on older deployments may still have the old id
+    lying around."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -3266,17 +3807,17 @@ def get_evaluator_by_slug(slug: str) -> Optional[Dict[str, Any]]:
 
 def evaluator_name_exists(
     name: str,
-    owner_user_id: Optional[str],
+    org_uuid: Optional[str],
     exclude_uuid: Optional[str] = None,
 ) -> bool:
-    """True if `name` is already used in the evaluator namespace visible to a user."""
+    """True if `name` is already used in the evaluator namespace visible to an org."""
     clauses = ["deleted_at IS NULL", "name = ?"]
     params: List[Any] = [name]
-    if owner_user_id is None:
-        clauses.append("owner_user_id IS NULL")
+    if org_uuid is None:
+        clauses.append("org_uuid IS NULL")
     else:
-        clauses.append("(owner_user_id = ? OR owner_user_id IS NULL)")
-        params.append(owner_user_id)
+        clauses.append("(org_uuid = ? OR org_uuid IS NULL)")
+        params.append(org_uuid)
     if exclude_uuid is not None:
         clauses.append("uuid != ?")
         params.append(exclude_uuid)
@@ -3291,26 +3832,26 @@ def evaluator_name_exists(
 
 
 def get_all_evaluators(
-    user_id: Optional[str] = None,
+    org_uuid: Optional[str] = None,
     include_defaults: bool = True,
     evaluator_type: Optional[str] = None,
     data_type: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """List evaluators visible to a user: their own + (optionally) seeded defaults.
+    """List evaluators visible to an org: their own + (optionally) seeded defaults.
 
-    When user_id is None, returns all non-deleted evaluators (admin view).
+    When org_uuid is None, returns all non-deleted evaluators (admin view).
     """
     with get_db_connection() as conn:
         cursor = conn.cursor()
         clauses = ["deleted_at IS NULL"]
         params: List[Any] = []
-        if user_id is not None:
+        if org_uuid is not None:
             if include_defaults:
-                clauses.append("(owner_user_id = ? OR owner_user_id IS NULL)")
-                params.append(user_id)
+                clauses.append("(org_uuid = ? OR org_uuid IS NULL)")
+                params.append(org_uuid)
             else:
-                clauses.append("owner_user_id = ?")
-                params.append(user_id)
+                clauses.append("org_uuid = ?")
+                params.append(org_uuid)
         if evaluator_type is not None:
             clauses.append("evaluator_type = ?")
             params.append(evaluator_type)
@@ -3320,7 +3861,7 @@ def get_all_evaluators(
         query = (
             "SELECT * FROM evaluators WHERE "
             + " AND ".join(clauses)
-            + " ORDER BY owner_user_id IS NULL DESC, created_at DESC"
+            + " ORDER BY org_uuid IS NULL DESC, created_at DESC"
         )
         cursor.execute(query, params)
         return [_parse_evaluator_row(r) for r in cursor.fetchall()]
@@ -3382,14 +3923,14 @@ def update_evaluator(
 
 
 def delete_evaluator(evaluator_uuid: str) -> bool:
-    """Soft-delete an evaluator. Default (owner_user_id IS NULL) evaluators cannot be deleted."""
+    """Soft-delete an evaluator. Seeded default (org_uuid IS NULL) evaluators cannot be deleted."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
             """
             UPDATE evaluators
                SET deleted_at = CURRENT_TIMESTAMP
-             WHERE uuid = ? AND deleted_at IS NULL AND owner_user_id IS NOT NULL
+             WHERE uuid = ? AND deleted_at IS NULL AND org_uuid IS NOT NULL
             """,
             (evaluator_uuid,),
         )
@@ -3501,9 +4042,10 @@ def set_evaluator_live_version(evaluator_uuid: str, version_uuid: str) -> bool:
 def duplicate_evaluator(
     source_uuid: str,
     new_name: str,
-    owner_user_id: str,
+    org_uuid: str,
+    owner_user_id: Optional[str] = None,
 ) -> Optional[str]:
-    """Duplicate an evaluator (and all its versions) under `owner_user_id` as a custom evaluator.
+    """Duplicate an evaluator (and all its versions) into `org_uuid` as a custom evaluator.
 
     Returns the new evaluator's UUID, or None if the source wasn't found.
     """
@@ -3517,15 +4059,16 @@ def duplicate_evaluator(
         cursor.execute(
             """
             INSERT INTO evaluators
-                (uuid, name, description, owner_user_id,
+                (uuid, name, description, owner_user_id, org_uuid,
                  evaluator_type, data_type, kind, output_type)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 new_uuid,
                 new_name,
                 source.get("description"),
                 owner_user_id,
+                org_uuid,
                 source.get("evaluator_type", "llm"),
                 source.get("data_type", "text"),
                 source.get("kind", "single"),
@@ -3854,29 +4397,33 @@ def set_test_evaluators(
 
 
 def create_simulation(
-    name: str, agent_id: Optional[str] = None, user_id: str = None
+    name: str,
+    org_uuid: str,
+    agent_id: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> str:
     """Create a new simulation and return its UUID.
 
     Args:
         name: Name of the simulation
+        org_uuid: UUID of the org this simulation belongs to (access key — required)
         agent_id: Optional UUID of the linked agent
-        user_id: UUID of the user creating this simulation (required)
+        user_id: UUID of the user creating this simulation (audit / created-by)
 
     Raises:
-        ValueError: If user_id is not provided
+        ValueError: If org_uuid is not provided
     """
-    if not user_id:
-        raise ValueError("user_id is required when creating a simulation")
+    if not org_uuid:
+        raise ValueError("org_uuid is required when creating a simulation")
     with get_db_connection() as conn:
         cursor = conn.cursor()
         simulation_uuid = str(uuid.uuid4())
         cursor.execute(
             """
-            INSERT INTO simulations (uuid, name, agent_id, user_id)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO simulations (uuid, name, agent_id, user_id, org_uuid)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (simulation_uuid, name, agent_id, user_id),
+            (simulation_uuid, name, agent_id, user_id, org_uuid),
         )
         conn.commit()
         logger.info(f"Created simulation with UUID: {simulation_uuid}")
@@ -3897,14 +4444,14 @@ def get_simulation(simulation_uuid: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def get_all_simulations(user_id: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Get all simulations, optionally filtered by user_id."""
+def get_all_simulations(org_uuid: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Get all simulations, optionally filtered by org_uuid."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        if user_id:
+        if org_uuid:
             cursor.execute(
-                "SELECT * FROM simulations WHERE deleted_at IS NULL AND user_id = ? ORDER BY created_at DESC",
-                (user_id,),
+                "SELECT * FROM simulations WHERE deleted_at IS NULL AND org_uuid = ? ORDER BY created_at DESC",
+                (org_uuid,),
             )
         else:
             cursor.execute(
@@ -4331,7 +4878,8 @@ def get_all_agent_tests() -> List[Dict[str, Any]]:
 
 def create_job(
     job_type: str,
-    user_id: str,
+    org_uuid: str,
+    user_id: Optional[str] = None,
     status: str = "in_progress",
     details: Optional[Dict[str, Any]] = None,
     results: Optional[Dict[str, Any]] = None,
@@ -4340,11 +4888,14 @@ def create_job(
 
     Args:
         job_type: Type of job (stt-eval, tts-eval, llm-unit-test, llm-benchmark)
-        user_id: UUID of the user who owns this job
+        org_uuid: UUID of the org this job belongs to (access key — required)
+        user_id: UUID of the user who triggered this job (audit / created-by)
         status: Initial status (defaults to 'in_progress')
         details: JSON config needed to re-trigger the job if interrupted
         results: Initial results (usually None)
     """
+    if not org_uuid:
+        raise ValueError("org_uuid is required when creating a job")
     with get_db_connection() as conn:
         cursor = conn.cursor()
         job_uuid = str(uuid.uuid4())
@@ -4352,14 +4903,14 @@ def create_job(
         results_json = json.dumps(results) if results is not None else None
         cursor.execute(
             """
-            INSERT INTO jobs (uuid, user_id, type, status, details, results)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO jobs (uuid, user_id, org_uuid, type, status, details, results)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (job_uuid, user_id, job_type, status, details_json, results_json),
+            (job_uuid, user_id, org_uuid, job_type, status, details_json, results_json),
         )
         conn.commit()
         logger.info(
-            f"Created job with UUID: {job_uuid}, type: {job_type}, user_id: {user_id}"
+            f"Created job with UUID: {job_uuid}, type: {job_type}, org_uuid: {org_uuid}"
         )
         return job_uuid
 
@@ -4374,14 +4925,14 @@ def _parse_job_row(row: sqlite3.Row) -> Dict[str, Any]:
     return job
 
 
-def get_job(job_uuid: str, user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Get a job by UUID, optionally filtered by user_id. Soft-deleted jobs are excluded."""
+def get_job(job_uuid: str, org_uuid: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Get a job by UUID, optionally filtered by org_uuid. Soft-deleted jobs are excluded."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        if user_id:
+        if org_uuid:
             cursor.execute(
-                "SELECT * FROM jobs WHERE uuid = ? AND user_id = ? AND deleted_at IS NULL",
-                (job_uuid, user_id),
+                "SELECT * FROM jobs WHERE uuid = ? AND org_uuid = ? AND deleted_at IS NULL",
+                (job_uuid, org_uuid),
             )
         else:
             cursor.execute(
@@ -4394,19 +4945,19 @@ def get_job(job_uuid: str, user_id: Optional[str] = None) -> Optional[Dict[str, 
         return None
 
 
-def get_all_jobs(user_id: str, job_type: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Get all jobs for a user, optionally filtered by type. Soft-deleted excluded."""
+def get_all_jobs(org_uuid: str, job_type: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Get all jobs for an org, optionally filtered by type. Soft-deleted excluded."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         if job_type:
             cursor.execute(
-                "SELECT * FROM jobs WHERE user_id = ? AND type = ? AND deleted_at IS NULL ORDER BY created_at DESC",
-                (user_id, job_type),
+                "SELECT * FROM jobs WHERE org_uuid = ? AND type = ? AND deleted_at IS NULL ORDER BY created_at DESC",
+                (org_uuid, job_type),
             )
         else:
             cursor.execute(
-                "SELECT * FROM jobs WHERE user_id = ? AND deleted_at IS NULL ORDER BY created_at DESC",
-                (user_id,),
+                "SELECT * FROM jobs WHERE org_uuid = ? AND deleted_at IS NULL ORDER BY created_at DESC",
+                (org_uuid,),
             )
         rows = cursor.fetchall()
         return [_parse_job_row(row) for row in rows]
@@ -4458,22 +5009,22 @@ def count_running_jobs(job_types: Optional[List[str]] = None) -> int:
         return cursor.fetchone()[0]
 
 
-def count_running_jobs_for_user(
-    user_id: str, job_types: Optional[List[str]] = None
+def count_running_jobs_for_org(
+    org_uuid: str, job_types: Optional[List[str]] = None
 ) -> int:
-    """Count jobs with status 'in_progress' for a specific user, optionally filtered by job types."""
+    """Count jobs with status 'in_progress' for a specific org, optionally filtered by job types."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         if job_types:
             placeholders = ",".join("?" for _ in job_types)
             cursor.execute(
-                f"SELECT COUNT(*) FROM jobs WHERE status = 'in_progress' AND user_id = ? AND type IN ({placeholders}) AND deleted_at IS NULL",
-                [user_id] + job_types,
+                f"SELECT COUNT(*) FROM jobs WHERE status = 'in_progress' AND org_uuid = ? AND type IN ({placeholders}) AND deleted_at IS NULL",
+                [org_uuid] + job_types,
             )
         else:
             cursor.execute(
-                "SELECT COUNT(*) FROM jobs WHERE status = 'in_progress' AND user_id = ? AND deleted_at IS NULL",
-                (user_id,),
+                "SELECT COUNT(*) FROM jobs WHERE status = 'in_progress' AND org_uuid = ? AND deleted_at IS NULL",
+                (org_uuid,),
             )
         return cursor.fetchone()[0]
 
@@ -4717,10 +5268,10 @@ def get_all_agent_test_jobs(job_type: Optional[str] = None) -> List[Dict[str, An
         return [_parse_agent_test_job_row(row) for row in rows]
 
 
-def get_agent_test_jobs_for_user(
-    user_id: str, job_type: Optional[str] = None
+def get_agent_test_jobs_for_org(
+    org_uuid: str, job_type: Optional[str] = None
 ) -> List[Dict[str, Any]]:
-    """Get all agent test jobs belonging to a user (across all their agents).
+    """Get all agent test jobs belonging to an org (across all its agents).
 
     Joins agent_test_jobs with agents so that each returned dict includes
     ``agent_name`` and ``agent_id`` alongside the normal job fields.
@@ -4734,10 +5285,10 @@ def get_agent_test_jobs_for_user(
                 SELECT atj.*, a.name AS agent_name, a.uuid AS agent_id
                 FROM agent_test_jobs atj
                 JOIN agents a ON atj.agent_id = a.uuid
-                WHERE a.user_id = ? AND a.deleted_at IS NULL AND atj.type = ?
+                WHERE a.org_uuid = ? AND a.deleted_at IS NULL AND atj.type = ?
                 ORDER BY atj.updated_at DESC
                 """,
-                (user_id, job_type),
+                (org_uuid, job_type),
             )
         else:
             cursor.execute(
@@ -4745,10 +5296,10 @@ def get_agent_test_jobs_for_user(
                 SELECT atj.*, a.name AS agent_name, a.uuid AS agent_id
                 FROM agent_test_jobs atj
                 JOIN agents a ON atj.agent_id = a.uuid
-                WHERE a.user_id = ? AND a.deleted_at IS NULL
+                WHERE a.org_uuid = ? AND a.deleted_at IS NULL
                 ORDER BY atj.updated_at DESC
                 """,
-                (user_id,),
+                (org_uuid,),
             )
         rows = cursor.fetchall()
         return [_parse_agent_test_job_row(row) for row in rows]
@@ -4770,14 +5321,14 @@ def get_queued_agent_test_jobs(
 ) -> List[Dict[str, Any]]:
     """Get all agent test jobs with status 'queued', optionally filtered by job types.
 
-    Returns jobs with user_id included (via agent ownership).
+    Returns jobs with org_uuid (and user_id, for audit) included via the parent agent.
     """
     with get_db_connection() as conn:
         cursor = conn.cursor()
         if job_types:
             placeholders = ",".join("?" for _ in job_types)
             cursor.execute(
-                f"""SELECT atj.*, a.user_id FROM agent_test_jobs atj
+                f"""SELECT atj.*, a.user_id, a.org_uuid FROM agent_test_jobs atj
                     JOIN agents a ON atj.agent_id = a.uuid
                     WHERE atj.status = 'queued' AND atj.type IN ({placeholders})
                     ORDER BY atj.created_at ASC""",
@@ -4785,7 +5336,7 @@ def get_queued_agent_test_jobs(
             )
         else:
             cursor.execute(
-                """SELECT atj.*, a.user_id FROM agent_test_jobs atj
+                """SELECT atj.*, a.user_id, a.org_uuid FROM agent_test_jobs atj
                    JOIN agents a ON atj.agent_id = a.uuid
                    WHERE atj.status = 'queued'
                    ORDER BY atj.created_at ASC"""
@@ -4811,10 +5362,10 @@ def count_running_agent_test_jobs(job_types: Optional[List[str]] = None) -> int:
         return cursor.fetchone()[0]
 
 
-def count_running_agent_test_jobs_for_user(
-    user_id: str, job_types: Optional[List[str]] = None
+def count_running_agent_test_jobs_for_org(
+    org_uuid: str, job_types: Optional[List[str]] = None
 ) -> int:
-    """Count agent test jobs with status 'in_progress' for a specific user (via agent ownership)."""
+    """Count agent test jobs with status 'in_progress' for a specific org (via agent ownership)."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         if job_types:
@@ -4822,15 +5373,15 @@ def count_running_agent_test_jobs_for_user(
             cursor.execute(
                 f"""SELECT COUNT(*) FROM agent_test_jobs atj
                     JOIN agents a ON atj.agent_id = a.uuid
-                    WHERE atj.status = 'in_progress' AND a.user_id = ? AND atj.type IN ({placeholders})""",
-                [user_id] + job_types,
+                    WHERE atj.status = 'in_progress' AND a.org_uuid = ? AND atj.type IN ({placeholders})""",
+                [org_uuid] + job_types,
             )
         else:
             cursor.execute(
                 """SELECT COUNT(*) FROM agent_test_jobs atj
                    JOIN agents a ON atj.agent_id = a.uuid
-                   WHERE atj.status = 'in_progress' AND a.user_id = ?""",
-                (user_id,),
+                   WHERE atj.status = 'in_progress' AND a.org_uuid = ?""",
+                (org_uuid,),
             )
         return cursor.fetchone()[0]
 
@@ -5032,14 +5583,14 @@ def get_queued_simulation_jobs(
 ) -> List[Dict[str, Any]]:
     """Get all simulation jobs with status 'queued', optionally filtered by job types.
 
-    Returns jobs with user_id included (via simulation ownership).
+    Returns jobs with org_uuid (and user_id, for audit) included via the parent simulation.
     """
     with get_db_connection() as conn:
         cursor = conn.cursor()
         if job_types:
             placeholders = ",".join("?" for _ in job_types)
             cursor.execute(
-                f"""SELECT sj.*, s.user_id FROM simulation_jobs sj
+                f"""SELECT sj.*, s.user_id, s.org_uuid FROM simulation_jobs sj
                     JOIN simulations s ON sj.simulation_id = s.uuid
                     WHERE sj.status = 'queued' AND sj.type IN ({placeholders})
                     ORDER BY sj.created_at ASC""",
@@ -5047,7 +5598,7 @@ def get_queued_simulation_jobs(
             )
         else:
             cursor.execute(
-                """SELECT sj.*, s.user_id FROM simulation_jobs sj
+                """SELECT sj.*, s.user_id, s.org_uuid FROM simulation_jobs sj
                    JOIN simulations s ON sj.simulation_id = s.uuid
                    WHERE sj.status = 'queued'
                    ORDER BY sj.created_at ASC"""
@@ -5073,10 +5624,10 @@ def count_running_simulation_jobs(job_types: Optional[List[str]] = None) -> int:
         return cursor.fetchone()[0]
 
 
-def count_running_simulation_jobs_for_user(
-    user_id: str, job_types: Optional[List[str]] = None
+def count_running_simulation_jobs_for_org(
+    org_uuid: str, job_types: Optional[List[str]] = None
 ) -> int:
-    """Count simulation jobs with status 'in_progress' for a specific user (via simulation ownership)."""
+    """Count simulation jobs with status 'in_progress' for a specific org (via simulation ownership)."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         if job_types:
@@ -5084,15 +5635,15 @@ def count_running_simulation_jobs_for_user(
             cursor.execute(
                 f"""SELECT COUNT(*) FROM simulation_jobs sj
                     JOIN simulations s ON sj.simulation_id = s.uuid
-                    WHERE sj.status = 'in_progress' AND s.user_id = ? AND sj.type IN ({placeholders})""",
-                [user_id] + job_types,
+                    WHERE sj.status = 'in_progress' AND s.org_uuid = ? AND sj.type IN ({placeholders})""",
+                [org_uuid] + job_types,
             )
         else:
             cursor.execute(
                 """SELECT COUNT(*) FROM simulation_jobs sj
                    JOIN simulations s ON sj.simulation_id = s.uuid
-                   WHERE sj.status = 'in_progress' AND s.user_id = ?""",
-                (user_id,),
+                   WHERE sj.status = 'in_progress' AND s.org_uuid = ?""",
+                (org_uuid,),
             )
         return cursor.fetchone()[0]
 
@@ -5195,32 +5746,39 @@ def delete_simulation_job(job_uuid: str) -> bool:
 # ============ Dataset Functions ============
 
 
-def create_dataset(name: str, dataset_type: str, user_id: str) -> str:
+def create_dataset(
+    name: str,
+    dataset_type: str,
+    org_uuid: str,
+    user_id: Optional[str] = None,
+) -> str:
     """Create a new dataset and return its UUID."""
     if dataset_type not in ("stt", "tts"):
         raise ValueError("Dataset type must be 'stt' or 'tts'")
+    if not org_uuid:
+        raise ValueError("org_uuid is required when creating a dataset")
     with get_db_connection() as conn:
         cursor = conn.cursor()
         dataset_uuid = str(uuid.uuid4())
         cursor.execute(
             """
-            INSERT INTO datasets (uuid, name, type, user_id)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO datasets (uuid, name, type, user_id, org_uuid)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (dataset_uuid, name, dataset_type, user_id),
+            (dataset_uuid, name, dataset_type, user_id, org_uuid),
         )
         conn.commit()
         logger.info(f"Created dataset with UUID: {dataset_uuid}")
         return dataset_uuid
 
 
-def get_dataset(dataset_uuid: str, user_id: str) -> Optional[Dict[str, Any]]:
-    """Get a dataset by UUID, scoped to the authenticated user."""
+def get_dataset(dataset_uuid: str, org_uuid: str) -> Optional[Dict[str, Any]]:
+    """Get a dataset by UUID, scoped to the caller's org."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT * FROM datasets WHERE uuid = ? AND user_id = ? AND deleted_at IS NULL",
-            (dataset_uuid, user_id),
+            "SELECT * FROM datasets WHERE uuid = ? AND org_uuid = ? AND deleted_at IS NULL",
+            (dataset_uuid, org_uuid),
         )
         row = cursor.fetchone()
         if row:
@@ -5229,20 +5787,20 @@ def get_dataset(dataset_uuid: str, user_id: str) -> Optional[Dict[str, Any]]:
 
 
 def get_all_datasets(
-    user_id: str, dataset_type: Optional[str] = None
+    org_uuid: str, dataset_type: Optional[str] = None
 ) -> List[Dict[str, Any]]:
-    """Get all datasets for a user, optionally filtered by type."""
+    """Get all datasets for an org, optionally filtered by type."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         if dataset_type:
             cursor.execute(
-                "SELECT * FROM datasets WHERE user_id = ? AND type = ? AND deleted_at IS NULL ORDER BY created_at DESC",
-                (user_id, dataset_type),
+                "SELECT * FROM datasets WHERE org_uuid = ? AND type = ? AND deleted_at IS NULL ORDER BY created_at DESC",
+                (org_uuid, dataset_type),
             )
         else:
             cursor.execute(
-                "SELECT * FROM datasets WHERE user_id = ? AND deleted_at IS NULL ORDER BY created_at DESC",
-                (user_id,),
+                "SELECT * FROM datasets WHERE org_uuid = ? AND deleted_at IS NULL ORDER BY created_at DESC",
+                (org_uuid,),
             )
         rows = cursor.fetchall()
         return [dict(row) for row in rows]
@@ -5298,13 +5856,13 @@ def get_active_dataset_ids(dataset_uuids: List[str]) -> set:
         return {row[0] for row in cursor.fetchall()}
 
 
-def update_dataset_name(dataset_uuid: str, user_id: str, name: str) -> bool:
+def update_dataset_name(dataset_uuid: str, org_uuid: str, name: str) -> bool:
     """Rename a dataset. Returns True if found and updated."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "UPDATE datasets SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE uuid = ? AND user_id = ? AND deleted_at IS NULL",
-            (name, dataset_uuid, user_id),
+            "UPDATE datasets SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE uuid = ? AND org_uuid = ? AND deleted_at IS NULL",
+            (name, dataset_uuid, org_uuid),
         )
         conn.commit()
         updated = cursor.rowcount > 0
@@ -5313,17 +5871,16 @@ def update_dataset_name(dataset_uuid: str, user_id: str, name: str) -> bool:
         return updated
 
 
-def delete_dataset(dataset_uuid: str, user_id: str) -> bool:
+def delete_dataset(dataset_uuid: str, org_uuid: str) -> bool:
     """Soft delete a dataset and all its items. Returns True if found and deleted."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "UPDATE datasets SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE uuid = ? AND user_id = ? AND deleted_at IS NULL",
-            (dataset_uuid, user_id),
+            "UPDATE datasets SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE uuid = ? AND org_uuid = ? AND deleted_at IS NULL",
+            (dataset_uuid, org_uuid),
         )
         if cursor.rowcount == 0:
             return False
-        # Soft delete all items belonging to this dataset
         cursor.execute(
             "UPDATE dataset_items SET deleted_at = CURRENT_TIMESTAMP WHERE dataset_id = ? AND deleted_at IS NULL",
             (dataset_uuid,),
@@ -5482,33 +6039,33 @@ def delete_dataset_item(item_uuid: str, dataset_id: str) -> bool:
         return deleted
 
 
-# ============ User Limits Functions ============
+# ============ Org Limits Functions ============
 
 
-def create_user_limits(user_id: str, limits: "UserLimits") -> str:
-    """Create a user limits row. Returns the UUID."""
+def create_org_limits(org_uuid: str, limits: "OrgLimits") -> str:
+    """Create an org_limits row. Returns the UUID."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         row_uuid = str(uuid.uuid4())
         cursor.execute(
             """
-            INSERT INTO user_limits (uuid, user_id, limits)
+            INSERT INTO org_limits (uuid, org_uuid, limits)
             VALUES (?, ?, ?)
             """,
-            (row_uuid, user_id, limits.model_dump_json()),
+            (row_uuid, org_uuid, limits.model_dump_json()),
         )
         conn.commit()
-        logger.info(f"Created user_limits for user {user_id} with UUID: {row_uuid}")
+        logger.info(f"Created org_limits for org {org_uuid} with UUID: {row_uuid}")
         return row_uuid
 
 
-def get_user_limits(user_id: str) -> Optional[Dict[str, Any]]:
-    """Get user limits by user_id."""
+def get_org_limits(org_uuid: str) -> Optional[Dict[str, Any]]:
+    """Get org limits by org_uuid."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT * FROM user_limits WHERE user_id = ?",
-            (user_id,),
+            "SELECT * FROM org_limits WHERE org_uuid = ?",
+            (org_uuid,),
         )
         row = cursor.fetchone()
         if row:
@@ -5518,20 +6075,20 @@ def get_user_limits(user_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def update_user_limits(user_id: str, limits: "UserLimits") -> Optional[Dict[str, Any]]:
-    """Update limits JSON for a user. Returns the updated row, or None if not found."""
+def update_org_limits(org_uuid: str, limits: "OrgLimits") -> Optional[Dict[str, Any]]:
+    """Update limits JSON for an org. Returns the updated row, or None if not found."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "UPDATE user_limits SET limits = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
-            (limits.model_dump_json(), user_id),
+            "UPDATE org_limits SET limits = ?, updated_at = CURRENT_TIMESTAMP WHERE org_uuid = ?",
+            (limits.model_dump_json(), org_uuid),
         )
         conn.commit()
         if cursor.rowcount == 0:
             return None
         cursor.execute(
-            "SELECT * FROM user_limits WHERE user_id = ?",
-            (user_id,),
+            "SELECT * FROM org_limits WHERE org_uuid = ?",
+            (org_uuid,),
         )
         row = cursor.fetchone()
         if row:
@@ -5541,13 +6098,13 @@ def update_user_limits(user_id: str, limits: "UserLimits") -> Optional[Dict[str,
         return None
 
 
-def delete_user_limits(user_id: str) -> bool:
-    """Delete user limits row. Returns True if deleted."""
+def delete_org_limits(org_uuid: str) -> bool:
+    """Delete org limits row. Returns True if deleted."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "DELETE FROM user_limits WHERE user_id = ?",
-            (user_id,),
+            "DELETE FROM org_limits WHERE org_uuid = ?",
+            (org_uuid,),
         )
         conn.commit()
         return cursor.rowcount > 0
@@ -5565,13 +6122,14 @@ ANNOTATION_TASK_TYPES = ("llm", "stt", "tts", "simulation")
 
 def create_annotation_task(
     name: str,
-    user_id: str,
+    org_uuid: str,
     type: str,
+    user_id: Optional[str] = None,
     description: Optional[str] = None,
 ) -> str:
     """Create a new annotation task and return its UUID."""
-    if not user_id:
-        raise ValueError("user_id is required when creating an annotation task")
+    if not org_uuid:
+        raise ValueError("org_uuid is required when creating an annotation task")
     if type not in ANNOTATION_TASK_TYPES:
         raise ValueError(f"type must be one of {ANNOTATION_TASK_TYPES}, got {type!r}")
     with get_db_connection() as conn:
@@ -5579,10 +6137,10 @@ def create_annotation_task(
         task_uuid = str(uuid.uuid4())
         cursor.execute(
             """
-            INSERT INTO annotation_tasks (uuid, user_id, name, description, type)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO annotation_tasks (uuid, user_id, org_uuid, name, description, type)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (task_uuid, user_id, name, description, type),
+            (task_uuid, user_id, org_uuid, name, description, type),
         )
         conn.commit()
         logger.info(f"Created annotation task with UUID: {task_uuid}")
@@ -5608,7 +6166,7 @@ def get_annotation_task(task_uuid: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def get_all_annotation_tasks(user_id: str) -> List[Dict[str, Any]]:
+def get_all_annotation_tasks(org_uuid: str) -> List[Dict[str, Any]]:
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -5617,10 +6175,10 @@ def get_all_annotation_tasks(user_id: str) -> List[Dict[str, Any]]:
                    (SELECT COUNT(*) FROM annotation_items i
                      WHERE i.task_id = t.uuid AND i.deleted_at IS NULL) AS item_count
               FROM annotation_tasks t
-             WHERE t.deleted_at IS NULL AND t.user_id = ?
+             WHERE t.deleted_at IS NULL AND t.org_uuid = ?
              ORDER BY t.created_at DESC
             """,
-            (user_id,),
+            (org_uuid,),
         )
         return [_parse_annotation_task_row(r) for r in cursor.fetchall()]
 
@@ -5783,23 +6341,24 @@ def remove_evaluator_from_annotation_task(task_id: str, evaluator_id: str) -> bo
         return cursor.rowcount > 0
 
 
-def create_annotator(name: str, user_id: str) -> str:
-    """Create a new annotator. Name must be unique per user (active rows)."""
-    if not user_id:
-        raise ValueError("user_id is required when creating an annotator")
+def create_annotator(name: str, org_uuid: str, user_id: Optional[str] = None) -> str:
+    """Create a new annotator. Name must be unique per org (active rows)."""
+    if not org_uuid:
+        raise ValueError("org_uuid is required when creating an annotator")
     name = name.strip()
     if not name:
         raise ValueError("annotator name must not be empty")
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        # If a soft-deleted annotator exists with the same name, restore it.
+        # If a soft-deleted annotator exists with the same name in this org,
+        # restore it.
         cursor.execute(
             """
             SELECT uuid FROM annotators
-             WHERE user_id = ? AND name = ? AND deleted_at IS NOT NULL
+             WHERE org_uuid = ? AND name = ? AND deleted_at IS NOT NULL
              ORDER BY id DESC LIMIT 1
             """,
-            (user_id, name),
+            (org_uuid, name),
         )
         existing = cursor.fetchone()
         if existing:
@@ -5814,14 +6373,13 @@ def create_annotator(name: str, user_id: str) -> str:
         # IntegrityError on the partial unique index propagates upward —
         # callers wrap with `name_uniqueness_guard("Annotator")` so a
         # duplicate-name collision becomes a 409 via the global FastAPI
-        # handler. The previous catch-and-rewrap-as-ValueError lost the
-        # original SQLite error type, defeating the guard.
+        # handler.
         cursor.execute(
             """
-            INSERT INTO annotators (uuid, user_id, name)
-            VALUES (?, ?, ?)
+            INSERT INTO annotators (uuid, user_id, org_uuid, name)
+            VALUES (?, ?, ?, ?)
             """,
-            (annotator_uuid, user_id, name),
+            (annotator_uuid, user_id, org_uuid, name),
         )
         conn.commit()
         logger.info(f"Created annotator with UUID: {annotator_uuid}")
@@ -5861,16 +6419,16 @@ def get_annotators_by_uuids(
         return {row["uuid"]: dict(row) for row in cursor.fetchall()}
 
 
-def get_all_annotators(user_id: str) -> List[Dict[str, Any]]:
+def get_all_annotators(org_uuid: str) -> List[Dict[str, Any]]:
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
             """
             SELECT * FROM annotators
-             WHERE deleted_at IS NULL AND user_id = ?
+             WHERE deleted_at IS NULL AND org_uuid = ?
              ORDER BY name ASC
             """,
-            (user_id,),
+            (org_uuid,),
         )
         return [dict(r) for r in cursor.fetchall()]
 
@@ -6347,8 +6905,8 @@ def get_jobs_for_annotator(annotator_id: str) -> List[Dict[str, Any]]:
         return [_parse_annotation_job_row(r) for r in cursor.fetchall()]
 
 
-def get_job_counts_for_user_annotators(user_id: str) -> Dict[str, int]:
-    """`{annotator_uuid: live_job_count}` for every annotator owned by user.
+def get_job_counts_for_org_annotators(org_uuid: str) -> Dict[str, int]:
+    """`{annotator_uuid: live_job_count}` for every annotator in this org.
     Single-query alternative to calling `get_jobs_for_annotator` in a loop.
     Annotators with zero jobs are returned with `0`."""
     with get_db_connection() as conn:
@@ -6360,10 +6918,10 @@ def get_job_counts_for_user_annotators(user_id: str) -> Dict[str, int]:
               FROM annotators a
               LEFT JOIN annotation_jobs j
                 ON j.annotator_id = a.uuid AND j.deleted_at IS NULL
-             WHERE a.user_id = ? AND a.deleted_at IS NULL
+             WHERE a.org_uuid = ? AND a.deleted_at IS NULL
              GROUP BY a.uuid
             """,
-            (user_id,),
+            (org_uuid,),
         )
         return {r["annotator_uuid"]: r["jobs_count"] for r in cursor.fetchall()}
 
@@ -6513,8 +7071,8 @@ def get_evaluator_runs_for_task(task_uuid: str) -> List[Dict[str, Any]]:
         return [_parse_evaluator_run_row(r) for r in cursor.fetchall()]
 
 
-def get_evaluator_runs_for_user(user_id: str) -> List[Dict[str, Any]]:
-    """All non-deleted evaluator_runs across every annotation task this user owns."""
+def get_evaluator_runs_for_org(org_uuid: str) -> List[Dict[str, Any]]:
+    """All non-deleted evaluator_runs across every annotation task in this org."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -6523,38 +7081,38 @@ def get_evaluator_runs_for_user(user_id: str) -> List[Dict[str, Any]]:
               FROM evaluator_runs er
               JOIN annotation_items ai ON ai.uuid = er.item_id
               JOIN annotation_tasks t ON t.uuid = ai.task_id
-             WHERE t.user_id = ?
+             WHERE t.org_uuid = ?
                AND t.deleted_at IS NULL
                AND ai.deleted_at IS NULL
                AND er.deleted_at IS NULL
              ORDER BY er.id ASC
             """,
-            (user_id,),
+            (org_uuid,),
         )
         return [_parse_evaluator_run_row(r) for r in cursor.fetchall()]
 
 
-def get_evaluator_runs_for_evaluator_user_scoped(
+def get_evaluator_runs_for_evaluator_org_scoped(
     evaluator_id: str,
-    user_id: str,
+    org_uuid: str,
     task_id: Optional[str] = None,
     version_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """All non-deleted evaluator_runs for a specific evaluator across user-owned
+    """All non-deleted evaluator_runs for a specific evaluator across org-owned
     tasks, with `task_id` included in each returned row.
 
     Optional filters:
       - `task_id`: restrict to runs whose item belongs to this task.
       - `version_id`: restrict to runs produced by a specific evaluator version.
     """
-    params: list = [evaluator_id, user_id]
+    params: list = [evaluator_id, org_uuid]
     query = """
         SELECT er.*, ai.task_id AS task_id
           FROM evaluator_runs er
           JOIN annotation_items ai ON ai.uuid = er.item_id
           JOIN annotation_tasks t ON t.uuid = ai.task_id
          WHERE er.evaluator_id = ?
-           AND t.user_id = ?
+           AND t.org_uuid = ?
            AND t.deleted_at IS NULL
            AND ai.deleted_at IS NULL
            AND er.deleted_at IS NULL
@@ -6585,10 +7143,10 @@ def get_evaluator_runs_for_item(item_uuid: str) -> List[Dict[str, Any]]:
 
 
 def get_annotations_for_annotator_overlap_slots(
-    user_id: str, annotator_id: str
+    org_uuid: str, annotator_id: str
 ) -> List[Dict[str, Any]]:
     """All annotations on slots (item_id, evaluator_id) where `annotator_id`
-    has annotated, scoped to tasks owned by `user_id`. Returns every annotator's
+    has annotated, scoped to tasks in `org_uuid`. Returns every annotator's
     judgement on those slots so pairwise agreement can be computed."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -6599,7 +7157,7 @@ def get_annotations_for_annotator_overlap_slots(
               JOIN annotation_jobs j ON j.uuid = a.job_id
               JOIN annotation_tasks t ON t.uuid = j.task_id
               JOIN annotation_items ai ON ai.uuid = a.item_id
-             WHERE t.user_id = ?
+             WHERE t.org_uuid = ?
                AND t.deleted_at IS NULL
                AND j.deleted_at IS NULL
                AND a.deleted_at IS NULL
@@ -6616,7 +7174,7 @@ def get_annotations_for_annotator_overlap_slots(
                )
              ORDER BY a.updated_at ASC
             """,
-            (user_id, annotator_id),
+            (org_uuid, annotator_id),
         )
         return [_parse_annotation_row(r) for r in cursor.fetchall()]
 
@@ -6928,12 +7486,12 @@ def get_annotations_for_task(
         return [_parse_annotation_row(r) for r in cursor.fetchall()]
 
 
-def get_annotations_for_user(
-    user_id: str,
+def get_annotations_for_org(
+    org_uuid: str,
     since: Optional[str] = None,
     until: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """All annotations across all of a user's annotation tasks. Annotations on
+    """All annotations across all of an org's annotation tasks. Annotations on
     soft-deleted items (or in soft-deleted tasks) are excluded."""
     query = (
         "SELECT a.*, j.annotator_id AS annotator_id, j.task_id AS task_id "
@@ -6941,13 +7499,13 @@ def get_annotations_for_user(
         "  JOIN annotation_jobs j ON j.uuid = a.job_id "
         "  JOIN annotation_tasks t ON t.uuid = j.task_id "
         "  JOIN annotation_items ai ON ai.uuid = a.item_id "
-        " WHERE t.user_id = ? "
+        " WHERE t.org_uuid = ? "
         "   AND t.deleted_at IS NULL "
         "   AND j.deleted_at IS NULL "
         "   AND a.deleted_at IS NULL "
         "   AND ai.deleted_at IS NULL "
     )
-    params: List[Any] = [user_id]
+    params: List[Any] = [org_uuid]
     if since:
         query += " AND a.updated_at >= ? "
         params.append(since)
