@@ -9,6 +9,8 @@ async function main() {
     console.log(JSON.stringify({}));
     return;
   }
+
+  return;
   
   // Only trigger if .py files were changed
   console.log(JSON.stringify({

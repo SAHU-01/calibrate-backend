@@ -325,7 +325,7 @@ FastAPI's default docs routes are disabled (`docs_url=None`, `redoc_url=None`, `
 
 - `GET /` or `HEAD /` - Health check (HEAD supported for uptime monitors)
 - `POST /presigned-url` - Generate S3 presigned URL for uploads
-- `GET` or `HEAD /provider-status` - Check status of all configured providers (runs `calibrate status` CLI, non-blocking via `asyncio.create_subprocess_exec`). Returns `{"success": true}` if all pass, 503 with failed provider details if any fail. HEAD supported for uptime monitors.
+- `GET` or `HEAD /provider-status` - Return the latest cached status for all configured providers. `src/provider_status.py` owns the monitor, cache, `calibrate status` subprocess, and parser for both final-object JSON and newline-delimited progress/result events. A lifespan background task runs the monitor every `PROVIDER_STATUS_REFRESH_INTERVAL_SECONDS` seconds (default 300), with a per-check timeout from `PROVIDER_STATUS_CHECK_TIMEOUT_SECONDS` (default 120). The endpoint itself never runs the CLI; it returns immediately with 200 if cached providers all pass, 503 with failed provider details if one or more providers failed, and 503 if the cache is missing/stale (`PROVIDER_STATUS_CACHE_MAX_AGE_SECONDS`, default 900). This keeps uptime monitors from hitting nginx/proxy request timeouts while still allowing provider failures to trip the monitor.
 
 ---
 

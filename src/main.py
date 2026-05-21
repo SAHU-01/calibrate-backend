@@ -1,10 +1,8 @@
 import os
-import json
 import uuid
 import asyncio
-import subprocess
 import logging
-from typing import Literal, Optional, List, Dict, Any
+from typing import Literal, Optional, Dict, Any
 from contextlib import asynccontextmanager
 
 import httpx
@@ -62,6 +60,7 @@ from utils import (
     PRESIGNED_URL_EXPIRY_SECONDS,
 )
 from job_recovery import recover_pending_jobs
+from provider_status import provider_status_monitor
 
 
 # Set up logger
@@ -78,9 +77,16 @@ async def lifespan(app: FastAPI):
     init_db()
     logger.info("Checking for in_progress jobs to recover...")
     recover_pending_jobs()
-    yield
-    # Shutdown: Nothing to do for now
-    logger.info("Application shutting down")
+    provider_status_task = asyncio.create_task(provider_status_monitor.refresh_loop())
+    try:
+        yield
+    finally:
+        provider_status_task.cancel()
+        try:
+            await provider_status_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("Application shutting down")
 
 
 DOCS_USERNAME = os.getenv("DOCS_USERNAME", "admin")
@@ -253,74 +259,13 @@ async def get_presigned_url(request: PresignedURLRequest):
 @app.api_route("/provider-status", methods=["GET", "HEAD"])
 async def get_provider_status():
     """
-    Check the status of all configured providers by running `calibrate status`.
+    Return the latest cached status for all configured providers.
 
-    Returns the status of each provider. Raises 500 if any provider has failed.
+    A background task refreshes the cache by running `calibrate status`.
+    Returns 200 if all providers pass and 503 if any provider failed or the
+    cached result is missing/stale.
     """
-    try:
-        process = await asyncio.create_subprocess_exec(
-            "uv",
-            "run",
-            "calibrate",
-            "status",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(), timeout=120
-            )
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
-            raise HTTPException(
-                status_code=504,
-                detail="Provider status check timed out",
-            )
-    except FileNotFoundError:
-        raise HTTPException(
-            status_code=500,
-            detail="calibrate CLI not found",
-        )
-
-    stdout = stdout_bytes.decode()
-    stderr = stderr_bytes.decode()
-
-    if process.returncode != 0:
-        raise HTTPException(
-            status_code=500,
-            detail=f"calibrate status failed: {stderr.strip()}",
-        )
-
-    try:
-        providers = json.loads(stdout)
-    except json.JSONDecodeError:
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to parse calibrate status output",
-        )
-
-    # Check if any provider failed
-    failed_providers = {
-        name: info for name, info in providers.items() if info.get("status") != "pass"
-    }
-
-    if failed_providers:
-        failed_names = ", ".join(failed_providers.keys())
-        errors = {
-            name: info.get("error", "unknown error")
-            for name, info in failed_providers.items()
-        }
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "message": f"Providers failing: {failed_names}",
-                "failed_providers": errors,
-                "all_providers": providers,
-            },
-        )
-
-    return {"success": True}
+    return await provider_status_monitor.response()
 
 
 @app.get("/openrouter/providers")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -18,9 +19,24 @@ def app():
 
 @pytest.fixture(scope="module")
 def client(app):
+    async def idle_provider_status_loop():
+        await asyncio.sleep(3600)
+
     with patch("main.recover_pending_jobs"):
-        with TestClient(app) as c:
-            yield c
+        with patch(
+            "main.provider_status_monitor.refresh_loop", idle_provider_status_loop
+        ):
+            with TestClient(app) as c:
+                yield c
+
+
+@pytest.fixture(autouse=True)
+def reset_provider_status_cache():
+    import provider_status
+
+    provider_status.provider_status_monitor.clear_cache()
+    yield
+    provider_status.provider_status_monitor.clear_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -28,9 +44,21 @@ def client(app):
 # ---------------------------------------------------------------------------
 
 
+class _FakeStream:
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+
+    async def readline(self):
+        if self._chunks:
+            return self._chunks.pop(0)
+        return b""
+
+
 def _make_fake_process(returncode: int, stdout: bytes, stderr: bytes):
     process = MagicMock()
     process.returncode = returncode
+    process.stdout = _FakeStream([stdout] if stdout else [])
+    process.stderr = _FakeStream([stderr] if stderr else [])
     process.communicate = AsyncMock(return_value=(stdout, stderr))
     process.wait = AsyncMock(return_value=None)
     process.kill = MagicMock()
@@ -38,18 +66,25 @@ def _make_fake_process(returncode: int, stdout: bytes, stderr: bytes):
 
 
 def test_provider_status_all_pass(client):
+    import provider_status
+
     process = _make_fake_process(
         0, json.dumps({"openai": {"status": "pass"}}).encode(), b""
     )
     with patch(
-        "main.asyncio.create_subprocess_exec", AsyncMock(return_value=process)
+        "provider_status.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=process),
     ):
+        asyncio.run(provider_status.provider_status_monitor.refresh_cache())
         resp = client.get("/provider-status")
     assert resp.status_code == 200
     assert resp.json()["success"] is True
+    assert resp.json()["cached"] is True
 
 
 def test_provider_status_some_failed(client):
+    import provider_status
+
     process = _make_fake_process(
         0,
         json.dumps(
@@ -58,52 +93,136 @@ def test_provider_status_some_failed(client):
         b"",
     )
     with patch(
-        "main.asyncio.create_subprocess_exec", AsyncMock(return_value=process)
+        "provider_status.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=process),
     ):
+        asyncio.run(provider_status.provider_status_monitor.refresh_cache())
         resp = client.get("/provider-status")
     assert resp.status_code == 503
+    body = resp.json()
+    assert body["success"] is False
+    assert body["failed_providers"] == {"deepgram": "x"}
 
 
 def test_provider_status_subprocess_non_zero(client):
+    import provider_status
+
     process = _make_fake_process(1, b"", b"boom")
     with patch(
-        "main.asyncio.create_subprocess_exec", AsyncMock(return_value=process)
+        "provider_status.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=process),
     ):
+        asyncio.run(provider_status.provider_status_monitor.refresh_cache())
         resp = client.get("/provider-status")
     assert resp.status_code == 500
+    assert resp.json()["message"] == "calibrate status failed: boom"
 
 
 def test_provider_status_invalid_json(client):
+    import provider_status
+
     process = _make_fake_process(0, b"not json", b"")
     with patch(
-        "main.asyncio.create_subprocess_exec", AsyncMock(return_value=process)
+        "provider_status.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=process),
     ):
+        asyncio.run(provider_status.provider_status_monitor.refresh_cache())
         resp = client.get("/provider-status")
     assert resp.status_code == 500
+    assert resp.json()["message"] == "Failed to parse calibrate status output"
 
 
 def test_provider_status_calibrate_not_found(client):
+    import provider_status
+
     with patch(
-        "main.asyncio.create_subprocess_exec",
+        "provider_status.asyncio.create_subprocess_exec",
         AsyncMock(side_effect=FileNotFoundError()),
     ):
+        asyncio.run(provider_status.provider_status_monitor.refresh_cache())
         resp = client.get("/provider-status")
     assert resp.status_code == 500
+    assert resp.json()["message"] == "calibrate CLI not found"
 
 
 def test_provider_status_timeout(client):
-    import asyncio
+    import provider_status
 
     process = MagicMock()
     process.returncode = 0
-    process.communicate = AsyncMock(side_effect=asyncio.TimeoutError())
+    process.stdout = MagicMock()
+    process.stdout.readline = AsyncMock(side_effect=asyncio.TimeoutError())
+    process.stderr = _FakeStream([])
     process.wait = AsyncMock(return_value=None)
     process.kill = MagicMock()
     with patch(
-        "main.asyncio.create_subprocess_exec", AsyncMock(return_value=process)
+        "provider_status.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=process),
     ):
+        asyncio.run(provider_status.provider_status_monitor.refresh_cache())
         resp = client.get("/provider-status")
     assert resp.status_code == 504
+
+
+def test_provider_status_not_checked_yet(client):
+    resp = client.get("/provider-status")
+    assert resp.status_code == 503
+    assert resp.json()["message"] == "Provider status has not been checked yet"
+
+
+def test_provider_status_parses_progress_event_output(app):
+    import provider_status
+
+    stdout = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "progress",
+                    "provider": "openai",
+                    "stage": "input_sent",
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "result",
+                    "provider": "openai",
+                    "result": {"status": "pass", "error": None},
+                }
+            ),
+        ]
+    )
+
+    assert provider_status.parse_provider_status_stdout(stdout) == {
+        "openai": {"status": "pass", "error": None}
+    }
+
+
+def test_provider_status_logs_streamed_output(client, caplog):
+    import logging
+    import provider_status
+
+    stdout_line = json.dumps(
+        {
+            "type": "progress",
+            "provider": "openai",
+            "stage": "input_sent",
+        }
+    ).encode()
+    process = _make_fake_process(
+        0,
+        stdout_line + b"\n",
+        b"stderr detail\n",
+    )
+
+    with caplog.at_level(logging.INFO, logger="provider_status"):
+        with patch(
+            "provider_status.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=process),
+        ):
+            asyncio.run(provider_status.provider_status_monitor.refresh_cache())
+
+    assert "Provider status stdout:" in caplog.text
+    assert "Provider status stderr: stderr detail" in caplog.text
 
 
 # ---------------------------------------------------------------------------
