@@ -1011,6 +1011,317 @@ def test_annotation_task_agreement_and_summary(client):
     assert missing_summary.status_code == 404
 
 
+def test_summary_surfaces_item_comments(client):
+    """Row-level (evaluator_id IS NULL) annotations carry per-(item, annotator)
+    free-text comments. The summary endpoint exposes them in a top-level
+    `item_comments` block, expands the `annotators[]` union to include
+    comment-only annotators, applies latest-wins per (item, annotator), and
+    drops the block to `{}` for items outside an `item_id` filter."""
+    auth = _signup(client)
+    h = auth["headers"]
+    llm_ev = _llm_evaluator(client, h)
+    task_uuid = client.post(
+        "/annotation-tasks",
+        json={
+            "name": f"t-{uuid.uuid4().hex[:6]}",
+            "type": "llm",
+            "evaluator_ids": [llm_ev["uuid"]],
+        },
+        headers=h,
+    ).json()["uuid"]
+    # Five items: two carry real comments, three carry one malformed shape
+    # each so every guard branch in the comment reader fires under coverage.
+    items = client.post(
+        f"/annotation-tasks/{task_uuid}/items",
+        json={
+            "items": [
+                {"payload": {"name": "i1"}},
+                {"payload": {"name": "i2"}},
+                {"payload": {"name": "i3-empty-string"}},
+                {"payload": {"name": "i4-non-string"}},
+                {"payload": {"name": "i5-non-dict"}},
+            ]
+        },
+        headers=h,
+    ).json()["item_ids"]
+    item_a, item_b, item_empty, item_non_string, item_non_dict = items
+
+    # Two annotators. `ann_rater` writes both an evaluator annotation AND a
+    # comment so it should appear in `annotators[]` via the per-evaluator
+    # path. `ann_commenter` writes only a comment — it must still appear in
+    # `annotators[]` via the comment-union path.
+    ann_rater = client.post(
+        "/annotators", json={"name": "rater"}, headers=h
+    ).json()
+    ann_commenter = client.post(
+        "/annotators", json={"name": "commenter"}, headers=h
+    ).json()
+    jobs = client.post(
+        f"/annotation-tasks/{task_uuid}/jobs",
+        json={
+            "annotator_ids": [ann_rater["uuid"], ann_commenter["uuid"]],
+            "item_ids": items,
+        },
+        headers=h,
+    ).json()["jobs"]
+    job_rater = next(j for j in jobs if j["annotator_id"] == ann_rater["uuid"])
+    job_commenter = next(
+        j for j in jobs if j["annotator_id"] == ann_commenter["uuid"]
+    )
+
+    # Per-evaluator annotation by `ann_rater` on item_a.
+    assert (
+        client.post(
+            f"/annotation-tasks/{task_uuid}/annotations",
+            json={
+                "job_id": job_rater["uuid"],
+                "item_id": item_a,
+                "evaluator_id": llm_ev["uuid"],
+                "value": {"value": True},
+            },
+            headers=h,
+        ).status_code
+        == 200
+    )
+
+    # Comment by `ann_rater` on item_a, then overwrite to test latest-wins.
+    for comment in ("first take", "final take"):
+        assert (
+            client.post(
+                f"/annotation-tasks/{task_uuid}/annotations",
+                json={
+                    "job_id": job_rater["uuid"],
+                    "item_id": item_a,
+                    "value": {"comment": comment},
+                },
+                headers=h,
+            ).status_code
+            == 200
+        )
+
+    # Comment-only annotator on item_a and item_b.
+    for it, comment in ((item_a, "from commenter"), (item_b, "on item b")):
+        assert (
+            client.post(
+                f"/annotation-tasks/{task_uuid}/annotations",
+                json={
+                    "job_id": job_commenter["uuid"],
+                    "item_id": it,
+                    "value": {"comment": comment},
+                },
+                headers=h,
+            ).status_code
+            == 200
+        )
+
+    # Malformed comment shapes must be ignored, not crash the response. One
+    # shape per item so the upsert keeps each row distinct (otherwise they
+    # collapse onto a single (job, item, evaluator=NULL) slot and only the
+    # final value persists, leaving the other guard branches uncovered).
+    malformed_by_item = {
+        item_empty: {"comment": ""},      # empty-string guard
+        item_non_string: {"comment": None},  # non-string guard
+        item_non_dict: None,              # non-dict guard
+    }
+    for malformed_item, bad_value in malformed_by_item.items():
+        assert (
+            client.post(
+                f"/annotation-tasks/{task_uuid}/annotations",
+                json={
+                    "job_id": job_rater["uuid"],
+                    "item_id": malformed_item,
+                    "value": bad_value,
+                },
+                headers=h,
+            ).status_code
+            == 200
+        )
+
+    # ---- Full summary ----------------------------------------------------
+    body = client.get(
+        f"/annotation-tasks/{task_uuid}/summary", headers=h
+    ).json()
+
+    # Annotator union includes the comment-only annotator.
+    union_uuids = {a["uuid"] for a in body["annotators"]}
+    assert ann_rater["uuid"] in union_uuids
+    assert ann_commenter["uuid"] in union_uuids
+
+    # item_comments shape: sparse, latest-wins, only valid string comments.
+    item_comments = body["item_comments"]
+    assert item_comments[item_a][ann_rater["uuid"]] == "final take"
+    assert item_comments[item_a][ann_commenter["uuid"]] == "from commenter"
+    assert item_comments[item_b] == {ann_commenter["uuid"]: "on item b"}
+    # Each malformed shape exercises a different guard branch in the reader
+    # and must produce an empty cell for that item (the key simply absent).
+    for malformed_item in (item_empty, item_non_string, item_non_dict):
+        assert malformed_item not in item_comments, (
+            f"malformed shape on {malformed_item!r} leaked into item_comments"
+        )
+
+    # ---- Filtered by item_id ----------------------------------------------
+    filtered = client.get(
+        f"/annotation-tasks/{task_uuid}/summary",
+        params={"item_id": item_a},
+        headers=h,
+    ).json()
+    # Only the filtered item appears in item_comments.
+    assert set(filtered["item_comments"].keys()) == {item_a}
+    # But annotators[] still reflects the task-wide union (per docstring).
+    assert {a["uuid"] for a in filtered["annotators"]} >= {
+        ann_rater["uuid"],
+        ann_commenter["uuid"],
+    }
+
+
+def test_summary_drops_comments_from_soft_deleted_annotator(client):
+    """`get_annotators_by_uuids` filters soft-deleted annotators, so any
+    `item_comments` entry keyed by a deleted UUID would have no matching
+    name in `annotators[]`. Verify the deleted annotator's comment is
+    pruned from `item_comments` instead of leaking as an orphan."""
+    auth = _signup(client)
+    h = auth["headers"]
+    llm_ev = _llm_evaluator(client, h)
+    task_uuid = client.post(
+        "/annotation-tasks",
+        json={
+            "name": f"t-{uuid.uuid4().hex[:6]}",
+            "type": "llm",
+            "evaluator_ids": [llm_ev["uuid"]],
+        },
+        headers=h,
+    ).json()["uuid"]
+    item_id = client.post(
+        f"/annotation-tasks/{task_uuid}/items",
+        json={"items": [{"payload": {"name": "i1"}}]},
+        headers=h,
+    ).json()["item_ids"][0]
+    kept = client.post(
+        "/annotators", json={"name": "kept"}, headers=h
+    ).json()
+    doomed = client.post(
+        "/annotators", json={"name": "doomed"}, headers=h
+    ).json()
+    jobs = client.post(
+        f"/annotation-tasks/{task_uuid}/jobs",
+        json={
+            "annotator_ids": [kept["uuid"], doomed["uuid"]],
+            "item_ids": [item_id],
+        },
+        headers=h,
+    ).json()["jobs"]
+    job_kept = next(j for j in jobs if j["annotator_id"] == kept["uuid"])
+    job_doomed = next(j for j in jobs if j["annotator_id"] == doomed["uuid"])
+
+    for job in (job_kept, job_doomed):
+        assert (
+            client.post(
+                f"/annotation-tasks/{task_uuid}/annotations",
+                json={
+                    "job_id": job["uuid"],
+                    "item_id": item_id,
+                    "value": {"comment": f"from {job['annotator_id']}"},
+                },
+                headers=h,
+            ).status_code
+            == 200
+        )
+
+    # Soft-delete the second annotator.
+    assert (
+        client.delete(f"/annotators/{doomed['uuid']}", headers=h).status_code
+        == 200
+    )
+
+    body = client.get(
+        f"/annotation-tasks/{task_uuid}/summary", headers=h
+    ).json()
+    annotator_uuids = {a["uuid"] for a in body["annotators"]}
+    assert doomed["uuid"] not in annotator_uuids
+    assert kept["uuid"] in annotator_uuids
+    # `kept`'s comment survives; `doomed`'s is pruned.
+    assert body["item_comments"][item_id] == {
+        kept["uuid"]: f"from {kept['uuid']}"
+    }
+
+
+def test_summary_comment_cleared_in_newer_job_wipes_older(client):
+    """When the same annotator has multiple jobs on the same task (e.g. admin
+    re-assigns items in a fresh batch), the (job_id, item_id, evaluator=NULL)
+    unique key keeps each job's row separate. A cleared/invalid comment in
+    the *newer* job must erase the older job's valid comment from
+    item_comments — otherwise the UI would show stale text after a clear."""
+    auth = _signup(client)
+    h = auth["headers"]
+    llm_ev = _llm_evaluator(client, h)
+    task_uuid = client.post(
+        "/annotation-tasks",
+        json={
+            "name": f"t-{uuid.uuid4().hex[:6]}",
+            "type": "llm",
+            "evaluator_ids": [llm_ev["uuid"]],
+        },
+        headers=h,
+    ).json()["uuid"]
+    item_id = client.post(
+        f"/annotation-tasks/{task_uuid}/items",
+        json={"items": [{"payload": {"name": "i1"}}]},
+        headers=h,
+    ).json()["item_ids"][0]
+    annotator = client.post(
+        "/annotators", json={"name": "rater"}, headers=h
+    ).json()
+
+    # Two separate jobs for the same annotator on the same item.
+    job_old = client.post(
+        f"/annotation-tasks/{task_uuid}/jobs",
+        json={"annotator_ids": [annotator["uuid"]], "item_ids": [item_id]},
+        headers=h,
+    ).json()["jobs"][0]
+    job_new = client.post(
+        f"/annotation-tasks/{task_uuid}/jobs",
+        json={"annotator_ids": [annotator["uuid"]], "item_ids": [item_id]},
+        headers=h,
+    ).json()["jobs"][0]
+    assert job_old["uuid"] != job_new["uuid"]
+
+    # Older job: valid comment.
+    assert (
+        client.post(
+            f"/annotation-tasks/{task_uuid}/annotations",
+            json={
+                "job_id": job_old["uuid"],
+                "item_id": item_id,
+                "value": {"comment": "old comment"},
+            },
+            headers=h,
+        ).status_code
+        == 200
+    )
+    # Newer job: cleared comment (empty string is the UI's "remove" signal).
+    assert (
+        client.post(
+            f"/annotation-tasks/{task_uuid}/annotations",
+            json={
+                "job_id": job_new["uuid"],
+                "item_id": item_id,
+                "value": {"comment": ""},
+            },
+            headers=h,
+        ).status_code
+        == 200
+    )
+
+    body = client.get(
+        f"/annotation-tasks/{task_uuid}/summary", headers=h
+    ).json()
+    # Newer "clear" must wipe the older "old comment" — item drops from
+    # item_comments entirely once the last cell is gone.
+    assert item_id not in body["item_comments"], (
+        "newer cleared comment did not erase older valid one"
+    )
+
+
 def test_evaluator_runs_endpoints(client, monkeypatch):
     auth = _signup(client)
     h = auth["headers"]
