@@ -107,7 +107,7 @@ async def get_current_user_id(
     return user_id
 
 
-SUPERADMIN_EMAIL = os.getenv("SUPERADMIN_EMAIL", "")
+SUPERADMIN_EMAIL = os.getenv("SUPERADMIN_EMAIL", "").strip()
 
 
 def is_superadmin_user(user_id: str) -> bool:
@@ -177,7 +177,9 @@ async def get_current_org(
     user_id = await get_current_user_id(credentials)
 
     payload = decode_token(credentials.credentials) or {}
-    is_superadmin = bool(SUPERADMIN_EMAIL) and payload.get("email", "") == SUPERADMIN_EMAIL
+    is_superadmin = (
+        bool(SUPERADMIN_EMAIL) and payload.get("email", "") == SUPERADMIN_EMAIL
+    )
 
     # Import lazily to dodge the circular dependency (db imports nothing from
     # auth_utils, but routers import both — keeping db out of module-load
@@ -231,5 +233,3 @@ async def get_optional_user_id(
         return None
 
     return payload.get("sub")
-
-
