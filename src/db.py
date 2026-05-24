@@ -771,14 +771,6 @@ def init_db():
             """
         )
 
-        # Enforce unique annotator name per account, ignoring soft-deleted rows.
-        cursor.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_annotators_user_name_active
-              ON annotators(user_id, name) WHERE deleted_at IS NULL
-            """
-        )
-
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS annotation_task_evaluators (
