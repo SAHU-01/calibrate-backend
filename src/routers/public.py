@@ -66,9 +66,12 @@ from routers.simulations import (
 from routers.agent_tests import (
     _enrich_test_results_with_evaluators,
     _enrich_model_results_with_evaluators,
+    _build_evaluators_block_for_test_run,
 )
 from routers.annotation_tasks import (
-    _enrich_runs_with_live_evaluator,
+    _build_evaluators_block_for_eval_job,
+    _strip_details_evaluators,
+    _strip_run_evaluator_blocks,
     _human_agreement_for_run,
     _shape_eval_job_for_response,
 )
@@ -112,6 +115,10 @@ class PublicTestRunResponse(BaseModel):
     total_tests: Optional[int] = None
     passed: Optional[int] = None
     failed: Optional[int] = None
+    # Top-level evaluator block — name/description/output_type/rubric
+    # shared across every judge_results row. Rows reference back via
+    # `evaluator_uuid` so the rubric isn't duplicated per test case.
+    evaluators: Optional[List[Dict[str, Any]]] = None
     results: Optional[List[Dict[str, Any]]] = None
     error: bool = False
 
@@ -119,6 +126,9 @@ class PublicTestRunResponse(BaseModel):
 class PublicBenchmarkResponse(BaseModel):
     task_id: str
     status: str
+    # Same as PublicTestRunResponse.evaluators — shared by every model's
+    # test_results inside model_results[] (all models run the same suite).
+    evaluators: Optional[List[Dict[str, Any]]] = None
     model_results: Optional[List[Dict[str, Any]]] = None
     leaderboard_summary: Optional[List[Dict[str, Any]]] = None
     error: bool = False
@@ -497,9 +507,15 @@ async def get_public_test_run(share_token: str):
     results = job.get("results") or {}
     details = job.get("details") or {}
 
+    evaluators_snapshot = details.get("evaluators_by_test_id") or {}
+    evaluator_cache: Dict[str, Optional[Dict[str, Any]]] = {}
     _enrich_test_results_with_evaluators(
-        results.get("test_results"),
-        details.get("evaluators_by_test_id") or {},
+        results.get("test_results"), evaluators_snapshot, evaluator_cache
+    )
+    evaluators_block = _build_evaluators_block_for_test_run(
+        evaluators_snapshot,
+        test_results=results.get("test_results"),
+        evaluator_cache=evaluator_cache,
     )
 
     return PublicTestRunResponse(
@@ -508,6 +524,7 @@ async def get_public_test_run(share_token: str):
         total_tests=results.get("total_tests"),
         passed=results.get("passed"),
         failed=results.get("failed"),
+        evaluators=evaluators_block or None,
         results=results.get("test_results"),
         error=bool(results.get("error")),
     )
@@ -529,14 +546,21 @@ async def get_public_benchmark(share_token: str):
     results = job.get("results") or {}
     details = job.get("details") or {}
 
+    evaluators_snapshot = details.get("evaluators_by_test_id") or {}
+    evaluator_cache: Dict[str, Optional[Dict[str, Any]]] = {}
     _enrich_model_results_with_evaluators(
-        results.get("model_results"),
-        details.get("evaluators_by_test_id") or {},
+        results.get("model_results"), evaluators_snapshot, evaluator_cache
+    )
+    evaluators_block = _build_evaluators_block_for_test_run(
+        evaluators_snapshot,
+        model_results=results.get("model_results"),
+        evaluator_cache=evaluator_cache,
     )
 
     return PublicBenchmarkResponse(
         task_id=task_id,
         status=status,
+        evaluators=evaluators_block or None,
         model_results=results.get("model_results"),
         leaderboard_summary=results.get("leaderboard_summary"),
         error=bool(results.get("error")),
@@ -640,6 +664,12 @@ async def get_public_annotation_eval(share_token: str):
     public_details = {
         k: v for k, v in details.items() if k in public_details_whitelist
     }
+    # `evaluators` is promoted to the response's top-level field — drop the
+    # slim snapshot from the forwarded `details` to keep the auth and
+    # public responses shaped the same way.
+    public_details.pop("evaluators", None)
+
+    evaluators_block = _build_evaluators_block_for_eval_job(details, raw_runs)
 
     return PublicAnnotationEvalResponse(
         task_id=task_uuid,
@@ -655,10 +685,13 @@ async def get_public_annotation_eval(share_token: str):
             description=task.get("description"),
         ),
         details=public_details,
-        evaluators=details.get("evaluators"),
+        evaluators=evaluators_block,
         item_count=details.get("item_count"),
         items=get_eval_job_items(job["uuid"]),
-        runs=_enrich_runs_with_live_evaluator(raw_runs),
+        # Per-run `evaluator` / `evaluator_version` blobs are intentionally
+        # not surfaced — `(evaluator_id, evaluator_version_id)` on each run
+        # keys back into the top-level evaluators[] block.
+        runs=_strip_run_evaluator_blocks(raw_runs),
         human_agreement=_human_agreement_for_run(task_uuid, raw_runs),
         error=shaped.get("error"),
     )

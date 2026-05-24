@@ -90,29 +90,9 @@ def _live_version_map(evaluators: List[Dict[str, Any]]) -> Dict[str, Optional[st
     return {e["uuid"]: e.get("live_version_id") for e in evaluators}
 
 
-def _evaluator_value_name(
-    value: Any,
-    output_type: Optional[str],
-    output_config: Optional[Dict[str, Any]],
-) -> Optional[str]:
-    """Map an evaluator-run scalar to its display name. Prefers an explicit
-    `name` from `output_config.scale`; falls back to `Correct`/`Wrong` for
-    binary true/false, and stringified score for rating."""
-    if value is None:
-        return None
-    scale = (output_config or {}).get("scale")
-    if isinstance(scale, list):
-        for entry in scale:
-            if entry.get("value") == value and entry.get("name"):
-                return entry["name"]
-    if output_type == "binary":
-        if value is True:
-            return "Correct"
-        if value is False:
-            return "Wrong"
-    if output_type == "rating" and isinstance(value, (int, float)):
-        return str(value)
-    return None
+# Re-exported for tests; canonical home is llm_judge so agent-tests/STT/TTS can
+# share the same scalar→label mapping.
+from llm_judge import evaluator_value_name as _evaluator_value_name  # noqa: E402
 
 
 def _enrich_evaluators_with_live_version(
@@ -322,12 +302,54 @@ async def delete_annotation_task_endpoint(
 # ============ Evaluator linking ============
 
 
-@router.get("/{task_uuid}/evaluators", response_model=List[Dict[str, Any]])
+@router.get("/{task_uuid}/evaluators")
 async def list_task_evaluators(
     task_uuid: str, ctx: OrgContext = Depends(get_current_org)
 ):
+    """Return each evaluator linked to this task in the same shape as
+    `GET /evaluators/{uuid}` — i.e. full `EvaluatorDetailResponse` with
+    `live_version` and the complete `versions[]` history. Lets the FE
+    render the per-evaluator detail (rubric, prompt, judge model,
+    variable specs) without an N+1 fan-out of `/evaluators/{uuid}` calls.
+    """
+    # Lazy import to avoid a circular module-load between the two router
+    # files (annotation_tasks ↔ evaluators).
+    from routers.evaluators import (
+        EvaluatorDetailResponse,
+        EvaluatorVersionResponse,
+        _evaluator_response,
+        _live_version_index,
+        _version_dict,
+    )
+    from db import get_evaluator_versions
+
     _ensure_owned_task(task_uuid, ctx.org_uuid)
-    return get_evaluators_for_annotation_task(task_uuid)
+    # `get_evaluators_for_annotation_task` projects a slim column set with a
+    # `linked_at` alias on the pivot — it omits the evaluator row's own
+    # `created_at`/`updated_at`. Refetch the canonical evaluator row so
+    # `_evaluator_response` has every field it expects.
+    linked = get_evaluators_for_annotation_task(task_uuid)
+    out: List[EvaluatorDetailResponse] = []
+    for stub in linked:
+        ev = get_evaluator(stub["uuid"])
+        if not ev:
+            continue
+        base = _evaluator_response(ev)
+        ev_output_type = ev.get("output_type", "binary")
+        versions = [
+            EvaluatorVersionResponse(**_version_dict(v, ev_output_type))
+            for v in get_evaluator_versions(ev["uuid"])
+        ]
+        out.append(
+            EvaluatorDetailResponse(
+                **base.model_dump(exclude={"live_version"}),
+                versions=versions,
+                live_version_index=_live_version_index(
+                    versions, base.live_version_id
+                ),
+            )
+        )
+    return out
 
 
 @router.post("/{task_uuid}/evaluators")
@@ -1298,6 +1320,124 @@ def _enrich_runs_with_live_evaluator(
     return out
 
 
+def _build_evaluators_block_for_eval_job(
+    job_details: Optional[Dict[str, Any]],
+    raw_runs: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Build the top-level `evaluators[]` block returned alongside an
+    evaluator-run job detail response. Mirrors the shape used by the
+    labelling-job viewer (`GET /public/annotation-jobs/view/{token}`) so the
+    FE can read `output_config.scale` from one consistent place across both
+    surfaces. Each entry pins the evaluator-VERSION the job actually ran
+    against (from `details.evaluators` snapshot), not the live version —
+    rubric edits after the run don't retroactively rewrite what the run
+    was measured by.
+
+    Also seeds entries from the runs themselves so jobs predating the
+    snapshot (legacy `details.evaluators` absent) still get a populated
+    block.
+    """
+    from llm_judge import _scale_bounds, default_output_config  # local to avoid module-load cycle
+
+    snapshot = (job_details or {}).get("evaluators") or []
+    # Dedupe (evaluator_id, evaluator_version_id) slots across snapshot
+    # and runs so legacy/snapshot-less jobs still emit one entry per pinned
+    # version actually used.
+    slots: List[tuple] = []
+    seen: set = set()
+    for entry in snapshot:
+        if not isinstance(entry, dict):
+            continue
+        slot = (entry.get("evaluator_id"), entry.get("evaluator_version_id"))
+        if slot[0] and slot not in seen:
+            seen.add(slot)
+            slots.append(slot)
+    for r in raw_runs or []:
+        slot = (r.get("evaluator_id"), r.get("evaluator_version_id"))
+        if slot[0] and slot not in seen:
+            seen.add(slot)
+            slots.append(slot)
+
+    # Look up the slim snapshot name as a final fallback for soft-deleted
+    # evaluators (get_evaluator filters deleted_at IS NULL).
+    snapshot_name_by_uuid: Dict[str, str] = {}
+    for entry in snapshot:
+        if isinstance(entry, dict) and entry.get("evaluator_id"):
+            snapshot_name_by_uuid.setdefault(
+                entry["evaluator_id"], entry.get("name") or ""
+            )
+
+    eval_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+    version_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+    out: List[Dict[str, Any]] = []
+    for ev_id, version_id in slots:
+        if ev_id not in eval_cache:
+            eval_cache[ev_id] = get_evaluator(ev_id)
+        ev = eval_cache.get(ev_id)
+        # If the evaluator was soft-deleted we still want a stub entry so
+        # rows[] consumers can resolve the slot — otherwise the FE sees
+        # `evaluator_id` references with no matching block entry. Fields
+        # we can't recover (description, output_type, rubric) stay null.
+        if version_id and version_id not in version_cache:
+            version_cache[version_id] = get_evaluator_version(version_id)
+        version = version_cache.get(version_id) if version_id else None
+        output_config = version.get("output_config") if version else None
+        # Apply the Correct/Wrong fallback for binary evaluators whose
+        # pinned version has a null rubric — consistent with the other
+        # evaluator-returning endpoints in this PR (evaluator detail,
+        # versions list, summary, agent-test block builder).
+        ev_output_type = ev.get("output_type") if ev else None
+        if output_config is None:
+            output_config = default_output_config(ev_output_type)
+        scale_min, scale_max = _scale_bounds(output_config)
+        out.append(
+            {
+                "uuid": ev_id,
+                "name": (ev.get("name") if ev else None)
+                or snapshot_name_by_uuid.get(ev_id),
+                "description": ev.get("description") if ev else None,
+                "output_type": ev.get("output_type") if ev else None,
+                "evaluator_type": ev.get("evaluator_type") if ev else None,
+                "data_type": ev.get("data_type") if ev else None,
+                "evaluator_version_id": version_id,
+                "version_number": (
+                    version.get("version_number") if version else None
+                ),
+                "judge_model": version.get("judge_model") if version else None,
+                "output_config": output_config,
+                "scale_min": scale_min,
+                "scale_max": scale_max,
+                "variables": version.get("variables") if version else None,
+                "deleted": ev is None,
+            }
+        )
+    return out
+
+
+def _strip_run_evaluator_blocks(
+    runs: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Return the runs without the per-row `evaluator` / `evaluator_version`
+    blobs. Callers surface that metadata via the top-level `evaluators[]`
+    block instead, keyed by `(evaluator_id, evaluator_version_id)` on each
+    run row."""
+    if not runs:
+        return runs
+    return [
+        {k: v for k, v in r.items() if k not in ("evaluator", "evaluator_version")}
+        for r in runs
+    ]
+
+
+def _strip_details_evaluators(shaped: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop the slim `evaluators` snapshot from `details` — promoted to the
+    response's top-level `evaluators[]` block (with rubric)."""
+    details = shaped.get("details")
+    if isinstance(details, dict) and "evaluators" in details:
+        shaped["details"] = {k: v for k, v in details.items() if k != "evaluators"}
+    return shaped
+
+
 def _shape_eval_job_for_response(job: Dict[str, Any]) -> Dict[str, Any]:
     """Adapt a generic-jobs row into the annotation-eval job response shape.
     Lifts task_id from `details` and exposes `error`/`completed_at` at the
@@ -1320,9 +1460,56 @@ def _shape_eval_job_for_response(job: Dict[str, Any]) -> Dict[str, Any]:
 async def list_evaluator_run_jobs(
     task_uuid: str, ctx: OrgContext = Depends(get_current_org)
 ):
+    """Slim list of evaluator-run jobs for the task. Each row carries
+    just the identifiers + status + counts + updated_at; the FE looks up
+    each row's evaluators via the top-level `evaluators[]` block by
+    `(evaluator_id, evaluator_version_id)`. Status `"done"` is normalized
+    to `"completed"` to match the detail endpoint."""
     _ensure_owned_task(task_uuid, ctx.org_uuid)
     jobs = get_generic_jobs_for_task(task_uuid, ANNOTATION_EVAL_JOB_TYPE)
-    return [_shape_eval_job_for_response(j) for j in jobs]
+
+    # Aggregate the per-job snapshots into one combined block so the FE
+    # only needs to fetch evaluator/version metadata once per unique
+    # (evaluator_id, evaluator_version_id) pair across the list.
+    combined_snapshot: List[Dict[str, Any]] = []
+    seen_slots: set = set()
+    for j in jobs:
+        for entry in (j.get("details") or {}).get("evaluators") or []:
+            if not isinstance(entry, dict):
+                continue
+            slot = (entry.get("evaluator_id"), entry.get("evaluator_version_id"))
+            if slot[0] and slot not in seen_slots:
+                seen_slots.add(slot)
+                combined_snapshot.append(entry)
+    evaluators_block = _build_evaluators_block_for_eval_job(
+        {"evaluators": combined_snapshot}, []
+    )
+
+    runs: List[Dict[str, Any]] = []
+    for j in jobs:
+        details = j.get("details") or {}
+        status = j.get("status")
+        if status == "done":
+            status = "completed"
+        row_evals = [
+            {
+                "evaluator_id": e.get("evaluator_id"),
+                "evaluator_version_id": e.get("evaluator_version_id"),
+            }
+            for e in (details.get("evaluators") or [])
+            if isinstance(e, dict) and e.get("evaluator_id")
+        ]
+        runs.append(
+            {
+                "uuid": j["uuid"],
+                "status": status,
+                "item_count": details.get("item_count"),
+                "updated_at": j.get("updated_at"),
+                "evaluators": row_evals,
+            }
+        )
+
+    return {"evaluators": evaluators_block, "runs": runs}
 
 
 def _human_agreement_for_run(
@@ -1447,17 +1634,26 @@ def _human_agreement_for_run(
             continue
         # Bucket the raw human annotations on this item by evaluator so the
         # FE can show every annotator's exact value alongside the agreement
-        # number. Annotations are already filtered to the run's slot set,
-        # so every entry here is in scope.
-        annotations_by_evaluator: Dict[str, List[Dict[str, Any]]] = {}
+        # number. Annotations are already filtered to the run's slot set.
+        #
+        # **Latest-wins per (evaluator, annotator)** — matches the summary
+        # endpoint's semantics ([`task_summary`](annotation_tasks.py)). If
+        # the same annotator labeled the same slot across multiple
+        # annotation jobs, only the most recent submission surfaces in
+        # `human_annotations[]`. Input is sorted by `updated_at ASC`
+        # (`get_annotations_for_slots`), so dict-overwrite per
+        # `(ev_id, annotator_id)` gives latest-wins.
+        latest_by_slot: Dict[tuple, Dict[str, Any]] = {}
         for a in item_annotations:
             ev_id = a.get("evaluator_id")
-            if not ev_id:
-                continue
             annotator_id = a.get("annotator_id")
-            annotator = (
-                annotators_by_uuid.get(annotator_id) if annotator_id else None
-            )
+            if not ev_id or not annotator_id:
+                continue
+            latest_by_slot[(ev_id, annotator_id)] = a
+
+        annotations_by_evaluator: Dict[str, List[Dict[str, Any]]] = {}
+        for (ev_id, annotator_id), a in latest_by_slot.items():
+            annotator = annotators_by_uuid.get(annotator_id) if annotator_id else None
             raw_value = a.get("value")
             reasoning = (
                 raw_value.get("reasoning")
@@ -1478,7 +1674,7 @@ def _human_agreement_for_run(
                 }
             )
         # Sort each evaluator's annotations deterministically (oldest first)
-        # so the FE can render them in submission order.
+        # so the FE can render them in a stable order.
         for entries in annotations_by_evaluator.values():
             entries.sort(key=lambda e: (e.get("updated_at") or "", e.get("annotation_id") or ""))
         # Inline the raw annotations onto each evaluator block keyed by
@@ -1537,7 +1733,17 @@ async def get_evaluator_run_job(
         raise HTTPException(status_code=404, detail="Job not found")
     shaped = _shape_eval_job_for_response(job)
     raw_runs = get_evaluator_runs_for_job(job_uuid)
-    shaped["runs"] = _enrich_runs_with_live_evaluator(raw_runs)
+    # Top-level evaluators[] mirrors the labelling-job viewer shape so the
+    # FE reads `output_config.scale` from one consistent place across the
+    # two surfaces. Each entry pins the version the job ran against.
+    shaped["evaluators"] = _build_evaluators_block_for_eval_job(
+        job.get("details"), raw_runs
+    )
+    _strip_details_evaluators(shaped)
+    # Per-run `evaluator` / `evaluator_version` are intentionally NOT
+    # surfaced here — `(evaluator_id, evaluator_version_id)` on each run
+    # row keys back into the top-level evaluators[] block.
+    shaped["runs"] = _strip_run_evaluator_blocks(raw_runs)
     shaped["human_agreement"] = _human_agreement_for_run(task_uuid, raw_runs)
     # Frozen item snapshot — what calibrate actually saw, regardless of
     # any post-submit edits / soft-deletes on the source annotation_items.
@@ -1753,35 +1959,63 @@ async def task_summary(
       {
         "task_id": str,
         "task_type": "stt" | "llm" | "simulation",
-        "evaluators": [{evaluator_id, name, output_type, run_count}],
-                                        # `run_count` = total evaluator-runs for
-                                        # this evaluator across ALL versions,
-                                        # over the items in scope (honors
-                                        # `item_id` filter; unaffected by
-                                        # `live_only`)
-        "annotators": [{uuid, name}],   # union of annotators with ≥1 (item, evaluator)
-                                        # annotation in this task; column order
+        "evaluators": [
+          {
+            "uuid": str,
+            "name": str, "description": str|null,
+            "output_type": "binary" | "rating",
+            "evaluator_type": str, "data_type": str,
+            "live_version_id": str|null,
+            "live_version_index": int|null,         # array position of the
+                                                    # live version inside
+                                                    # `versions[]`, or null
+                                                    # when no live version
+                                                    # / no match
+            "versions": [
+              {
+                "uuid": str|null,                   # null only for the
+                                                    # placeholder slot when
+                                                    # the evaluator has no
+                                                    # runs + no live version
+                "version_number": int|null,
+                "output_config": {scale: [...]}|null,  # binary defaults to
+                                                       # Correct/Wrong when
+                                                       # unset; rating stays
+                                                       # null
+                "scale_min": float|null,
+                "scale_max": float|null,
+                "is_live": bool
+              }
+            ],
+            "run_count": int,                       # total evaluator-runs
+                                                    # across ALL versions,
+                                                    # restricted to items in
+                                                    # scope (honors
+                                                    # `item_id`; ignores
+                                                    # `live_only`)
+          }
+        ],
+        "annotators": [{uuid, name}],               # union of annotators with
+                                                    # ≥1 (item, evaluator)
+                                                    # annotation in this task
         "rows": [
           {
             "item_id": str,
-            "payload": <item.payload>,             # FE derives display per task_type
-            "evaluator_id": str,
-            "evaluator_name": str,
-            "output_type": "binary" | "rating",
-            "evaluator_version_id": str | null,
-            "evaluator_version_number": int | null,
-            "evaluator_value": <scalar | null>,    # latest run on this slot
-            "evaluator_value_name": str | null,    # human-readable name for the
-                                                   # value: from output_config.scale
-                                                   # entry's `name` if set, else
-                                                   # `Correct`/`Wrong` for binary
-                                                   # true/false or stringified
-                                                   # score for rating
-            "evaluator_reasoning": str | null,
+            "payload": <item.payload>,              # FE derives display per task_type
+            "evaluator_id": str,                    # FK into evaluators[].uuid
+            "evaluator_version_id": str|null,       # FK into evaluators[].versions[].uuid
+            "evaluator_value": <scalar|null>,       # latest run on this slot
+            "evaluator_value_name": str|null,       # resolved label per row
+                                                    # (FE could re-derive
+                                                    # from output_config but
+                                                    # we precompute it)
+            "evaluator_reasoning": str|null,
             "annotations": {
-              "<annotator_uuid>": {"value": <scalar>, "reasoning": str | null} | null,
+              "<annotator_uuid>": {"value": <scalar>, "reasoning": str|null} | null,
               ...
-            }
+            },
+            "human_agreement": float|null,
+            "evaluator_agreement": float|null
           }
         ]
       }
@@ -1794,8 +2028,10 @@ async def task_summary(
         emitted per `(item, evaluator)`.
       - `evaluator_value` is the latest evaluator-run for THAT specific
         version slot, regardless of which evaluator-run job produced it.
-      - `is_live_version` flags rows whose `evaluator_version_id` matches
-        the evaluator's current `live_version_id`.
+      - To check whether a row is on the live version, compare
+        `evaluator_version_id` to the matching evaluator's `live_version_id`
+        (or use `live_version_index` to index `versions[]` and read `is_live`).
+        That flag is intentionally NOT duplicated on every row.
       - Each annotator cell is that annotator's latest annotation for the slot,
         across ALL annotation jobs (matches the agreement aggregator's
         latest-wins-per-annotator semantics). `null` if they haven't annotated it.
@@ -1993,28 +2229,12 @@ async def task_summary(
                     {
                         "item_id": item["uuid"],
                         "payload": item.get("payload"),
+                        # Reference into the top-level `evaluators[]` block
+                        # — name/description/output_type and the version's
+                        # rubric (output_config, scale_min/max, is_live)
+                        # live there, not duplicated on every row.
                         "evaluator_id": ev_id,
-                        "evaluator_name": ev.get("name"),
-                        "output_type": ev.get("output_type"),
                         "evaluator_version_id": version_id,
-                        "evaluator_version_number": (
-                            version_meta.get("version_number")
-                            if version_meta
-                            else None
-                        ),
-                        "scale_min": (
-                            version_meta.get("scale_min")
-                            if version_meta
-                            else None
-                        ),
-                        "scale_max": (
-                            version_meta.get("scale_max")
-                            if version_meta
-                            else None
-                        ),
-                        "is_live_version": (
-                            version_id == live_v if version_id else False
-                        ),
                         "evaluator_value": ev_value,
                         "evaluator_value_name": _evaluator_value_name(
                             ev_value,
@@ -2028,18 +2248,72 @@ async def task_summary(
                     }
                 )
 
+    # Build the enriched top-level `evaluators[]` block — one entry per
+    # linked evaluator with the per-version rubric inlined so the FE has
+    # everything to render row labels without joining per-row metadata.
+    from llm_judge import default_output_config
+
+    evaluators_block: List[Dict[str, Any]] = []
+    for ev in evaluators:
+        ev_id = ev["uuid"]
+        live_v = ev.get("live_version_id")
+        version_ids = _version_row_keys(ev_id, live_v)
+        versions_payload: List[Dict[str, Any]] = []
+        live_version_index: Optional[int] = None
+        for v_id in version_ids:
+            if v_id is None:
+                # Placeholder for evaluators with no live version + no runs
+                # — keep the slot so the table can still render an empty
+                # evaluator column.
+                versions_payload.append(
+                    {
+                        "uuid": None,
+                        "version_number": None,
+                        "output_config": default_output_config(
+                            ev.get("output_type")
+                        ),
+                        "scale_min": None,
+                        "scale_max": None,
+                        "is_live": False,
+                    }
+                )
+                continue
+            meta = _version_meta(v_id) or {}
+            output_config = meta.get("output_config")
+            if output_config is None:
+                output_config = default_output_config(ev.get("output_type"))
+            is_live = v_id == live_v
+            if is_live:
+                live_version_index = len(versions_payload)
+            versions_payload.append(
+                {
+                    "uuid": v_id,
+                    "version_number": meta.get("version_number"),
+                    "output_config": output_config,
+                    "scale_min": meta.get("scale_min"),
+                    "scale_max": meta.get("scale_max"),
+                    "is_live": is_live,
+                }
+            )
+        evaluators_block.append(
+            {
+                "uuid": ev_id,
+                "name": ev.get("name"),
+                "description": ev.get("description"),
+                "output_type": ev.get("output_type"),
+                "evaluator_type": ev.get("evaluator_type"),
+                "data_type": ev.get("data_type"),
+                "live_version_id": live_v,
+                "live_version_index": live_version_index,
+                "versions": versions_payload,
+                "run_count": run_count_by_evaluator.get(ev_id, 0),
+            }
+        )
+
     return {
         "task_id": task_uuid,
         "task_type": task["type"],
-        "evaluators": [
-            {
-                "evaluator_id": e["uuid"],
-                "name": e.get("name"),
-                "output_type": e.get("output_type"),
-                "run_count": run_count_by_evaluator.get(e["uuid"], 0),
-            }
-            for e in evaluators
-        ],
+        "evaluators": evaluators_block,
         "annotators": annotators,
         "rows": rows,
     }

@@ -57,6 +57,51 @@ def _format_scale_rubric(output_config: Optional[Dict[str, Any]]) -> str:
     return "\n\nRubric:\n" + "\n".join(lines)
 
 
+_DEFAULT_BINARY_OUTPUT_CONFIG: Dict[str, Any] = {
+    "scale": [
+        {"value": True, "name": "Correct"},
+        {"value": False, "name": "Wrong"},
+    ]
+}
+
+
+def default_output_config(output_type: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Sensible default `output_config` for versions that don't carry their
+    own rubric. Binary → Correct/Wrong scale (mirrors the
+    `evaluator_value_name` fallback). Rating returns None because no meaningful
+    default scale exists without bounds — `evaluator_value_name` falls back to
+    `str(value)` there, which the FE can replicate. Returns a deep-ish copy so
+    callers can mutate it without leaking back into the constant."""
+    if output_type == "binary":
+        return {"scale": [dict(e) for e in _DEFAULT_BINARY_OUTPUT_CONFIG["scale"]]}
+    return None
+
+
+def evaluator_value_name(
+    value: Any,
+    output_type: Optional[str],
+    output_config: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    """Map an evaluator-run scalar to its display name. Prefers an explicit
+    `name` from `output_config.scale`; falls back to `Correct`/`Wrong` for
+    binary true/false, and stringified score for rating."""
+    if value is None:
+        return None
+    scale = (output_config or {}).get("scale")
+    if isinstance(scale, list):
+        for entry in scale:
+            if entry.get("value") == value and entry.get("name"):
+                return entry["name"]
+    if output_type == "binary":
+        if value is True:
+            return "Correct"
+        if value is False:
+            return "Wrong"
+    if output_type == "rating" and isinstance(value, (int, float)):
+        return str(value)
+    return None
+
+
 def _scale_bounds(output_config: Optional[Dict[str, Any]]) -> tuple[Optional[float], Optional[float]]:
     """For rating evaluators, derive scale_min/scale_max from output_config.scale.
 

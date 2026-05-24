@@ -123,7 +123,17 @@ class EvaluatorVersionResponse(BaseModel):
     created_at: str
 
 
-class EvaluatorResponse(BaseModel):
+class EvaluatorResponseBase(BaseModel):
+    """Identity + classification fields shared by every evaluator response.
+
+    `live_version_id` is the FK pointer to the current live version. List
+    views inline the full version on `live_version` because there's no
+    `versions[]` to look it up in. Detail views skip the inlined block and
+    expose `versions[]` instead — clients resolve the live version by
+    matching `live_version_id` to a version entry's `uuid` (avoids
+    duplicating the same version payload twice in the same response).
+    """
+
     uuid: str
     name: str
     description: Optional[str] = None
@@ -136,11 +146,22 @@ class EvaluatorResponse(BaseModel):
     live_version_id: Optional[str] = None
     created_at: str
     updated_at: str
+
+
+class EvaluatorResponse(EvaluatorResponseBase):
+    # List shape: no `versions[]` here, so we inline the live version for
+    # the FE.
     live_version: Optional[EvaluatorVersionResponse] = None
 
 
-class EvaluatorDetailResponse(EvaluatorResponse):
+class EvaluatorDetailResponse(EvaluatorResponseBase):
+    # Detail shape: `versions[]` is the full history; `live_version_index`
+    # is the direct array position of the live version (None when the
+    # evaluator has no live version, or when the live id doesn't resolve
+    # to anything in `versions[]`). Clients should prefer the index over
+    # scanning `versions[]` by uuid.
     versions: List[EvaluatorVersionResponse]
+    live_version_index: Optional[int] = None
 
 
 class EvaluatorCreateResponse(BaseModel):
@@ -187,25 +208,54 @@ def _ensure_unique_evaluator_name(
         raise HTTPException(status_code=409, detail="Evaluator name already exists")
 
 
-def _version_dict(version: Dict[str, Any]) -> Dict[str, Any]:
-    """Shape an evaluator_versions row for the API response."""
+def _version_dict(
+    version: Dict[str, Any],
+    output_type: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Shape an evaluator_versions row for the API response. When `output_config`
+    is missing on the stored row, fill in the evaluator's default rubric for
+    the given `output_type` so consumers don't have to handle a null scale —
+    binary rows get Correct/Wrong, rating rows stay null (the FE falls back to
+    `str(value)`)."""
+    from llm_judge import default_output_config
+
+    output_config = version.get("output_config")
+    if output_config is None:
+        output_config = default_output_config(output_type)
     return {
         "uuid": version["uuid"],
         "version_number": version["version_number"],
         "judge_model": version["judge_model"],
         "system_prompt": version["system_prompt"],
-        "output_config": version.get("output_config"),
+        "output_config": output_config,
         "variables": version.get("variables"),
         "created_at": version["created_at"],
     }
 
 
+def _live_version_index(
+    versions: List[EvaluatorVersionResponse],
+    live_version_id: Optional[str],
+) -> Optional[int]:
+    """Position of the live version in `versions[]`, or None if no live
+    version is set or the id doesn't match any entry."""
+    if not live_version_id:
+        return None
+    for i, v in enumerate(versions):
+        if v.uuid == live_version_id:
+            return i
+    return None
+
+
 def _evaluator_response(evaluator: Dict[str, Any]) -> EvaluatorResponse:
     live_version = None
+    output_type = evaluator.get("output_type", "binary")
     if evaluator.get("live_version_id"):
         v = get_evaluator_version(evaluator["live_version_id"])
         if v:
-            live_version = EvaluatorVersionResponse(**_version_dict(v))
+            live_version = EvaluatorVersionResponse(
+                **_version_dict(v, output_type)
+            )
     return EvaluatorResponse(
         uuid=evaluator["uuid"],
         name=evaluator["name"],
@@ -331,8 +381,19 @@ async def get_evaluator_endpoint(
 ):
     evaluator = _visible_or_404(get_evaluator(evaluator_uuid), ctx.org_uuid)
     base = _evaluator_response(evaluator)
-    versions = [EvaluatorVersionResponse(**_version_dict(v)) for v in get_evaluator_versions(evaluator_uuid)]
-    return EvaluatorDetailResponse(**base.model_dump(), versions=versions)
+    output_type = evaluator.get("output_type", "binary")
+    versions = [
+        EvaluatorVersionResponse(**_version_dict(v, output_type))
+        for v in get_evaluator_versions(evaluator_uuid)
+    ]
+    # base carries `live_version` (list shape); drop it here — detail uses
+    # `versions[]` + `live_version_id`/`live_version_index` so we don't
+    # duplicate the version.
+    return EvaluatorDetailResponse(
+        **base.model_dump(exclude={"live_version"}),
+        versions=versions,
+        live_version_index=_live_version_index(versions, base.live_version_id),
+    )
 
 
 @router.put("/{evaluator_uuid}", response_model=EvaluatorResponse)
@@ -406,8 +467,15 @@ async def duplicate_evaluator_endpoint(
 async def list_versions(
     evaluator_uuid: str, ctx: OrgContext = Depends(get_current_org)
 ):
-    _visible_or_404(get_evaluator(evaluator_uuid), ctx.org_uuid)
-    return [EvaluatorVersionResponse(**_version_dict(v)) for v in get_evaluator_versions(evaluator_uuid)]
+    evaluator = _visible_or_404(get_evaluator(evaluator_uuid), ctx.org_uuid)
+    # Pass `output_type` so binary versions stored with a null
+    # output_config surface the Correct/Wrong default — consistent with
+    # the detail / list / annotation-tasks evaluator endpoints.
+    output_type = evaluator.get("output_type", "binary")
+    return [
+        EvaluatorVersionResponse(**_version_dict(v, output_type))
+        for v in get_evaluator_versions(evaluator_uuid)
+    ]
 
 
 @router.post("/{evaluator_uuid}/versions", response_model=VersionCreateResponse)

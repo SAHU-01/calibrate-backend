@@ -128,9 +128,38 @@ def test_annotation_task_crud(client):
         == 404
     )
 
-    # list task evaluators
+    # list task evaluators — must mirror GET /evaluators/{uuid} detail shape
     list_ev = client.get(f"/annotation-tasks/{task_uuid}/evaluators", headers=h)
     assert list_ev.status_code == 200
+    detail_list = list_ev.json()
+    assert isinstance(detail_list, list) and detail_list
+    one = detail_list[0]
+    # Spot-check the same fields the per-evaluator detail returns: full
+    # version history + live_version (with rubric).
+    assert one["uuid"] == llm_ev["uuid"]
+    assert "versions" in one and isinstance(one["versions"], list) and one["versions"]
+    # Detail shape intentionally has NO inline `live_version` — clients
+    # resolve it via `live_version_index` (or `live_version_id`) into
+    # `versions[]`. The index is the cheap path; the id is the fallback
+    # for when the id-list relationship needs to be re-verified.
+    assert "live_version" not in one
+    assert one["live_version_id"]
+    assert isinstance(one["live_version_index"], int)
+    live = one["versions"][one["live_version_index"]]
+    assert live["uuid"] == one["live_version_id"]
+    assert "output_config" in live
+    # Compare against the canonical detail endpoint so the two shapes don't
+    # drift apart silently.
+    canonical = client.get(f"/evaluators/{llm_ev['uuid']}", headers=h).json()
+    assert set(one.keys()) == set(canonical.keys())
+
+    # Versions never expose a null output_config for binary evaluators —
+    # they get the Correct/Wrong default when stored as null. Rating
+    # versions may still be null (no enumerable default without bounds).
+    for v in one["versions"]:
+        if one["output_type"] == "binary":
+            assert v["output_config"] is not None
+            assert v["output_config"].get("scale")
 
     # unlink evaluator
     unlink = client.delete(
@@ -788,6 +817,78 @@ def test_annotation_agreement_endpoints(client):
     assert missing_ev.status_code == 404
 
 
+def test_list_versions_applies_binary_default_output_config(client):
+    """GET /evaluators/{uuid}/versions must also apply the Correct/Wrong
+    default when a stored binary version has output_config=null —
+    consistent with the detail / list / annotation-tasks endpoints."""
+    import db as db_mod
+
+    auth = _signup(client)
+    h = auth["headers"]
+    # Create a binary evaluator, then directly insert a NULL-rubric
+    # version to simulate a legacy row.
+    create = client.post(
+        "/evaluators",
+        json={
+            "name": f"e-{uuid.uuid4().hex[:6]}",
+            "evaluator_type": "llm",
+            "data_type": "text",
+            "kind": "single",
+            "output_type": "binary",
+            "version": {
+                "judge_model": "openai/gpt-4",
+                "system_prompt": "p",
+                "variables": [],
+                "output_config": {
+                    "scale": [
+                        {"value": True, "name": "Custom"},
+                        {"value": False, "name": "Other"},
+                    ]
+                },
+            },
+        },
+        headers=h,
+    )
+    assert create.status_code == 200, create.text
+    ev_uuid = create.json()["uuid"]
+    db_mod.create_evaluator_version(
+        evaluator_uuid=ev_uuid,
+        judge_model="openai/gpt-4",
+        system_prompt="legacy",
+        output_config=None,
+        variables=None,
+    )
+    versions = client.get(f"/evaluators/{ev_uuid}/versions", headers=h).json()
+    legacy = next(v for v in versions if v["system_prompt"] == "legacy")
+    assert legacy["output_config"] == {
+        "scale": [
+            {"value": True, "name": "Correct"},
+            {"value": False, "name": "Wrong"},
+        ]
+    }
+
+
+def test_default_output_config_helper():
+    """Binary evaluators get a Correct/Wrong fallback rubric; rating evaluators
+    stay null because no meaningful default exists without bounds."""
+    from llm_judge import default_output_config
+
+    cfg = default_output_config("binary")
+    assert cfg == {
+        "scale": [
+            {"value": True, "name": "Correct"},
+            {"value": False, "name": "Wrong"},
+        ]
+    }
+    # Mutating returned config must not bleed into subsequent calls.
+    cfg["scale"][0]["name"] = "X"
+    assert default_output_config("binary")["scale"][0]["name"] == "Correct"
+
+    assert default_output_config("rating") is None
+    assert default_output_config(None) is None
+    assert default_output_config("unknown") is None
+
+
 def test_evaluator_value_name_mapping():
     from routers.annotation_tasks import _evaluator_value_name
 
@@ -862,6 +963,45 @@ def test_annotation_task_agreement_and_summary(client):
         headers=h,
     )
     assert summary_filtered.status_code == 200
+
+    # ---- Top-level evaluators[] / row shape contract --------------------
+    body = summary_filtered.json()
+    assert "evaluators" in body and len(body["evaluators"]) == 1
+    ev_entry = body["evaluators"][0]
+    # Enriched per-evaluator block carries identity + every version's rubric.
+    assert ev_entry["uuid"] == llm_ev["uuid"]
+    assert ev_entry["output_type"] in ("binary", "rating")
+    assert "description" in ev_entry
+    assert "live_version_id" in ev_entry
+    assert isinstance(ev_entry["versions"], list) and ev_entry["versions"]
+    # `live_version_index` indexes into versions[] (or None if no live).
+    if ev_entry["live_version_id"]:
+        assert isinstance(ev_entry["live_version_index"], int)
+        live_v = ev_entry["versions"][ev_entry["live_version_index"]]
+        assert live_v["is_live"] is True
+        assert live_v["uuid"] == ev_entry["live_version_id"]
+    # Rubric exposed once per version (binary defaults to Correct/Wrong).
+    for v in ev_entry["versions"]:
+        if ev_entry["output_type"] == "binary" and v["uuid"] is not None:
+            assert v["output_config"] is not None
+            assert v["output_config"]["scale"]
+
+    # Rows are minimal — evaluator-level / version-level fields live on the
+    # top-level evaluators[] block and MUST NOT be duplicated per row.
+    for row in body["rows"]:
+        assert row["evaluator_id"] == llm_ev["uuid"]
+        for forbidden in (
+            "evaluator_name",
+            "output_type",
+            "evaluator_version_number",
+            "scale_min",
+            "scale_max",
+            "is_live_version",
+        ):
+            assert forbidden not in row, (
+                f"row should not duplicate {forbidden} — read it from "
+                f"evaluators[] via evaluator_id/evaluator_version_id"
+            )
     # Missing item id → 404
     missing_summary = client.get(
         f"/annotation-tasks/{task_uuid}/summary",
